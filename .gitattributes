@@ -1,0 +1,10 @@
+/AGENTS.md export-ignore
+/report export-ignore
+/source/c export-ignore
+/examples/run/ggml.sh export-ignore
+/examples/run/ggml-kernel.sh export-ignore
+/.agents export-ignore
+/.codex export-ignore
+/.claude export-ignore
+/.codegraph export-ignore
+/tasks export-ignore

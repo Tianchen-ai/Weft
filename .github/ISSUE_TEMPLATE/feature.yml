@@ -1,0 +1,22 @@
+name: Feature or hardware support / 功能与硬件支持
+description: Describe a concrete application or target capability.
+body:
+  - type: textarea
+    id: usecase
+    attributes:
+      label: Use case / 使用场景
+      description: What program should a user be able to express or run?
+    validations:
+      required: true
+  - type: textarea
+    id: contract
+    attributes:
+      label: Required behavior / 所需行为
+      description: Include shapes, dtypes, state/effect behavior or an official ISA reference. Explain which existing path is insufficient.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Available implementation or hardware evidence / 实现与硬件依据
+      description: Link a reference mechanism, minimal program or target access details without credentials.

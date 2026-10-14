@@ -1,0 +1,104 @@
+name: Build and installed package
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: 2
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+      - name: Check public source boundary
+        run: |
+          python - <<'PY'
+          import subprocess
+          from pathlib import PurePosixPath
+          paths = subprocess.check_output(['git', 'ls-files'], text=True).splitlines()
+          private = {'report', 'tasks', 'AGENTS.md', '.agents', '.codex', '.claude', '.codegraph'}
+          forbidden = [name for name in paths if private.intersection(PurePosixPath(name).parts)
+                       or name.startswith('source/c/')
+                       or name in ('examples/run/ggml.sh', 'examples/run/ggml-kernel.sh')]
+          assert not forbidden, forbidden
+          PY
+      - name: Install matching LLVM and MLIR SDK
+        run: |
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm.asc
+          sudo install -m 0644 /tmp/llvm.asc /usr/share/keyrings/llvm.asc
+          echo 'deb [signed-by=/usr/share/keyrings/llvm.asc] https://apt.llvm.org/noble/ llvm-toolchain-noble-20 main' | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build llvm-20-dev libmlir-20-dev mlir-20-tools libzstd-dev libedit-dev
+      - name: Build source archive and its wheel
+        run: |
+          python -m pip install --upgrade 'pip>=23' build twine
+          python -m build --sdist --outdir /tmp/weft-dist
+          python - <<'PY'
+          from pathlib import Path
+          import tarfile
+          with tarfile.open(next(Path('/tmp/weft-dist').glob('*.tar.gz'))) as archive:
+              paths = ['/'.join(Path(name).parts[1:]) for name in archive.getnames()]
+          for required in ('LICENSE', 'NOTICE', 'licenses/LLVM.txt', 'CMakeLists.txt',
+                           'source/weft/programs/catalog.py', 'tools/install.py'):
+              assert required in paths, required
+          excluded = ('report/', 'source/c/', 'examples/', '.codegraph/', '.github/', 'build/')
+          assert not any(name.startswith(excluded) or '__pycache__' in name for name in paths)
+          PY
+          python -m pip wheel /tmp/weft-dist/weft_riscv-*.tar.gz --no-deps \
+            -Ccmake.define.LLVM_DIR=/usr/lib/llvm-20/lib/cmake/llvm \
+            -Ccmake.define.MLIR_DIR=/usr/lib/llvm-20/lib/cmake/mlir \
+            -w /tmp/weft-dist
+          python -m twine check /tmp/weft-dist/*
+      - name: Install and use outside the checkout
+        working-directory: /tmp
+        run: |
+          python -m pip install --no-deps /tmp/weft-dist/*.whl
+          weft --help
+          weft-compile --version
+          weft target --catalog
+          weft build --kernel weft.programs.normalization:rms_norm --meta BLOCK=64 \
+            --march rv64imafdcv --abi lp64d --vlen-bits 128 \
+            --source-only --output /tmp/weft-installed-rms
+          weft inspect /tmp/weft-installed-rms --emit operations --format text
+          weft inspect /tmp/weft-installed-rms --emit physical > /tmp/weft-physical.mlir
+          weft-opt --weft-riscv-verify-final --verify-each --verify-roundtrip \
+            /tmp/weft-physical.mlir -o /tmp/weft-verified.mlir
+          python - <<'PY'
+          import importlib.metadata
+          from pathlib import Path
+          import subprocess
+          import weft
+          from weft.programs import programs
+          assert len(programs()) > 0
+          distribution = importlib.metadata.distribution('weft-riscv')
+          assert distribution.metadata['License-Expression'] == 'Apache-2.0'
+          sdk = Path(subprocess.check_output(['weft', 'sdk', '--prefix'], text=True).strip())
+          for relative in ('include/weft/runtime.h', 'include/weft/runtime.hpp',
+                           'lib/libweft_runtime.so', 'lib/cmake/Weft/WeftConfig.cmake',
+                           'share/weft/llama.cpp/adapter.cpp', 'share/weft/licenses/LICENSE',
+                           'share/weft/licenses/licenses/LLVM.txt'):
+              assert (sdk / relative).is_file(), relative
+          print('Installed package:', weft.__file__)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64-build-artifacts
+          path: /tmp/weft-dist/*
+          retention-days: 7

@@ -1,0 +1,48 @@
+[build-system]
+requires = ["scikit-build-core>=0.11", "setuptools-scm>=8"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "weft-riscv"
+dynamic = ["version"]
+description = "Weft language and native RISC-V kernel compiler"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md", "licenses/*.txt"]
+requires-python = ">=3.10"
+keywords = ["riscv", "rvv", "compiler", "mlir", "kernels"]
+classifiers = [
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: C++",
+  "Topic :: Software Development :: Compilers",
+  "Topic :: Scientific/Engineering",
+]
+
+[project.urls]
+Homepage = "https://github.com/Tianchen-ai/Weft"
+Documentation = "https://tianchen-ai.github.io/Weft/"
+Source = "https://github.com/Tianchen-ai/Weft"
+Issues = "https://github.com/Tianchen-ai/Weft/issues"
+
+[project.optional-dependencies]
+numpy = ["numpy>=1.24"]
+torch = ["torch>=2.4"]
+
+[project.scripts]
+weft = "weft.cli:main"
+weft-compile = "weft.cli:compiler_main"
+weft-opt = "weft.cli:optimizer_main"
+
+[tool.scikit-build]
+minimum-version = "0.11"
+wheel.packages = {"weft" = "python/weft", "weft/programs" = "source/weft/programs"}
+wheel.py-api = "py3"
+wheel.exclude = ["**/__pycache__/**", "**/*.pyc"]
+build.targets = ["weft-compile", "weft-opt", "WeftRuntime"]
+install.components = ["WeftRuntime"]
+sdist.include = ["/CMakeLists.txt", "/include/**", "/lib/**", "/tools/**", "/python/**", "/cmake/**", "/integrations/**", "/source/weft/programs/**", "/README*.md", "/LICENSE", "/NOTICE", "/THIRD_PARTY_NOTICES.md", "/licenses/**", "!**/__pycache__/**", "!**/*.pyc"]
+sdist.exclude = ["/report/**", "/.codegraph/**", "/.github/**", "/AGENTS.md", "/build*/**", "/source/c/**", "/source/weft/dense/**", "/source/weft/ggml/**", "/examples/**", "**/__pycache__/**", "**/*.pyc"]
+metadata.version.provider = "scikit_build_core.metadata.setuptools_scm"
+
+[tool.setuptools_scm]

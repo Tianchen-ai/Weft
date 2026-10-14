@@ -1,0 +1,15 @@
+{
+  "binding_origin": "historical-selection",
+  "physical_defaults": {"lmul_eighths":8,"unroll":1,"pipeline_depth":1,"scalar_load_prime":0,"partial_combine_policy":"independent-multilevel","record_axis_policy":"within-record"},
+  "bindings": {
+    "kernel:k1 gemm_f32": {"entry":"gemm_f32.py","symbol":"gemm_f32","source":{"MC":64,"NC":16,"MR":4,"NR":4},"physical":{},"binding_origin":"measured-source-subset"},
+    "kernel:k1 gemv_f32": {"entry":"gemv_f32.py","symbol":"gemv_f32","source":{"MR":4,"KB":64},"physical":{}},
+    "kernel:k1 ime_i8_contract": {"entry":"ime_i8_contract.py","symbol":"ime_i8_contract","source":{"MR":4,"NR":4,"KB":8},"physical":{}},
+    "kernel:sg2044 gemm_f32": {"entry":"gemm_f32.py","symbol":"gemm_f32","source":{"MC":64,"NC":16,"MR":2,"NR":2},"physical":{"lmul_eighths":16},"binding_origin":"measured-source-physical-subset"},
+    "kernel:sg2044 gemv_f32": {"entry":"gemv_f32.py","symbol":"gemv_f32","source":{"MR":4,"KB":64},"physical":{}},
+    "mul-mat:k1 f32 decode": {"entry":"gemm_f32.py","symbol":"gemm_f32","source":{"NC":64,"MC":64,"NR":1,"MR":2},"physical":{"lmul_eighths":32}},
+    "mul-mat:k1 f32 prefill": {"entry":"gemm_f32.py","symbol":"gemm_f32","source":{"NC":16,"MC":64,"NR":4,"MR":4},"physical":{"lmul_eighths":8}},
+    "mul-mat:sg2044 f32 decode": {"entry":"gemm_f32.py","symbol":"gemm_f32","source":{"NC":16,"MC":64,"NR":2,"MR":2},"physical":{"lmul_eighths":16}},
+    "mul-mat:sg2044 f32 prefill": {"entry":"gemm_f32.py","symbol":"gemm_f32","source":{"NC":16,"MC":64,"NR":4,"MR":4},"physical":{"lmul_eighths":8}}
+  }
+}

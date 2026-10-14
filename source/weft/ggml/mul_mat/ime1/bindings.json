@@ -1,0 +1,14 @@
+{
+  "binding_origin": "targeted-native-aot-selection",
+  "measurement_target": "K1/X60",
+  "measured_source_candidates": {"NR": [4, 16]},
+  "source_parameter_domains": {"MR": [1, 4], "NR": [4, 16]},
+  "cases": {
+    "q4_0_decode": {"pack": "pack_q4_0", "kernel": "q4_centered_decode", "source": {"MR": 1, "NR": 16}},
+    "q4_0_prefill": {"pack": "pack_q4_0", "kernel": "q4_centered_prefill", "source": {"MR": 4, "NR": 16}},
+    "q4_1_decode": {"pack": "pack_q4_1", "kernel": "q4_affine_decode", "source": {"MR": 1, "NR": 16}},
+    "q4_1_prefill": {"pack": "pack_q4_1", "kernel": "q4_affine_prefill", "source": {"MR": 4, "NR": 16}},
+    "q4_K_decode": {"pack": "pack_q4_k", "kernel": "q4_affine_decode", "source": {"MR": 1, "NR": 16}},
+    "q4_K_prefill": {"pack": "pack_q4_k", "kernel": "q4_affine_prefill", "source": {"MR": 4, "NR": 16}}
+  }
+}

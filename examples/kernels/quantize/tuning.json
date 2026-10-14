@@ -1,0 +1,12 @@
+{
+  "binding_origin": "historical-selection",
+  "physical_defaults": {"lmul_eighths":8,"unroll":1,"pipeline_depth":1,"scalar_load_prime":0,"partial_combine_policy":"independent-multilevel","record_axis_policy":"within-record"},
+  "bindings": {
+    "kernel:k1 q8_0_quantize": {"entry":"q8_0.py","symbol":"q8_0_quantize","source":{},"physical":{}},
+    "kernel:k1 q8_1_quantize": {"entry":"q8_1.py","symbol":"q8_1_quantize","source":{},"physical":{}},
+    "kernel:k1 q8_K_quantize": {"entry":"q8_k.py","symbol":"q8_K_quantize","source":{},"physical":{"lmul_eighths":16}},
+    "kernel:sg2044 q8_0_quantize": {"entry":"q8_0.py","symbol":"q8_0_quantize","source":{},"physical":{"lmul_eighths":32,"unroll":1,"pipeline_depth":1}},
+    "kernel:sg2044 q8_1_quantize": {"entry":"q8_1.py","symbol":"q8_1_quantize","source":{},"physical":{"lmul_eighths":64}},
+    "kernel:sg2044 q8_K_quantize": {"entry":"q8_k.py","symbol":"q8_K_quantize","source":{},"physical":{"lmul_eighths":16,"unroll":1,"pipeline_depth":1}}
+  }
+}

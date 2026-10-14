@@ -1,0 +1,36 @@
+name: Bug report / 问题报告
+description: Report an installation, compiler, numerical or integration problem.
+body:
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and observed behavior / 预期与实际行为
+      description: Include the failing command and complete relevant diagnostic.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction / 最小复现
+      description: Supply the kernel and input shape/dtype. Avoid private data or credentials.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Revision, target and toolchain / 版本、目标与工具链
+      description: Include Weft revision, Python, LLVM/MLIR, C compiler, flags and `weft target` output when available.
+    validations:
+      required: true
+  - type: dropdown
+    id: boundary
+    attributes:
+      label: Failing boundary / 出错环节
+      options:
+        - Installation or packaging
+        - DSL or canonical IR
+        - Physical IR or C generation
+        - System C compilation or linking
+        - Native invocation or numerical result
+        - Torch or llama.cpp integration
+        - Unknown
