@@ -97,8 +97,17 @@ def quantize_activation(X, Xq):
             wl.store(Xq[row, kb].q, q)
 
 
+@weft.kernel
+def quantize_ime1_prefill(X: wl.View[wl.f32, (M, K)], Xq: wl.View[IMEQ8_I[4], (M, K)]):
+    quantize_activation(X, Xq)
+
+
 def mul_mat_centered(W, X, Xq, Y):
     quantize_activation(X, Xq)
+    packed_mat_centered(W, Xq, Y)
+
+
+def packed_mat_centered(W, Xq, Y):
     with wl.level.rows(M, group=wl.auto("MR")) as mb:
         with wl.level.cols(N, group=wl.auto("NR")) as nb:
             acc = wl.state(wl.f32, [MR, NR], init=0)
@@ -116,6 +125,10 @@ def mul_mat_centered(W, X, Xq, Y):
 
 def mul_mat_affine(W, X, Xq, Y):
     quantize_activation(X, Xq)
+    packed_mat_affine(W, Xq, Y)
+
+
+def packed_mat_affine(W, Xq, Y):
     with wl.level.rows(M, group=wl.auto("MR")) as mb:
         with wl.level.cols(N, group=wl.auto("NR")) as nb:
             acc = wl.state(wl.f32, [MR, NR], init=0)
@@ -149,3 +162,23 @@ def q4_affine_decode(W: wl.View[IMEQ4Affine_I[16], (N, K)], X: wl.View[wl.f32, (
 @weft.kernel
 def q4_affine_prefill(W: wl.View[IMEQ4Affine_I[16], (N, K)], X: wl.View[wl.f32, (M, K)], Xq: wl.View[IMEQ8_I[4], (M, K)], Y: wl.View[wl.f32, (M, N)]):
     mul_mat_affine(W, X, Xq, Y)
+
+
+@weft.kernel(strided=("Y",))
+def q4_centered_packed_decode(W: wl.View[IMEQ4Centered_I[16], (N, K)], Xq: wl.View[IMEQ8_I[1], (M, K)], Y: wl.View[wl.f32, (M, N)]):
+    packed_mat_centered(W, Xq, Y)
+
+
+@weft.kernel(strided=("Y",))
+def q4_affine_packed_decode(W: wl.View[IMEQ4Affine_I[16], (N, K)], Xq: wl.View[IMEQ8_I[1], (M, K)], Y: wl.View[wl.f32, (M, N)]):
+    packed_mat_affine(W, Xq, Y)
+
+
+@weft.kernel(strided=("Y",))
+def q4_centered_packed_prefill(W: wl.View[IMEQ4Centered_I[16], (N, K)], Xq: wl.View[IMEQ8_I[4], (M, K)], Y: wl.View[wl.f32, (M, N)]):
+    packed_mat_centered(W, Xq, Y)
+
+
+@weft.kernel(strided=("Y",))
+def q4_affine_packed_prefill(W: wl.View[IMEQ4Affine_I[16], (N, K)], Xq: wl.View[IMEQ8_I[4], (M, K)], Y: wl.View[wl.f32, (M, N)]):
+    packed_mat_affine(W, Xq, Y)

@@ -44,8 +44,8 @@ bool supportsRVVPartialPackedScale(TargetAttr target,
                                   llvm::ArrayRef<ValueType> scales,
                                   PartialSetType result);
 bool supportsRVVMaskedNegate(TargetAttr target, ValueType data, ValueType mask);
-bool supportsRVVWidenAdd(TargetAttr target, ValueType lhs, ValueType rhs,
-                         ValueType result);
+bool supportsRVVWidenBinary(TargetAttr target, ValueType lhs, ValueType rhs,
+                            ValueType result);
 bool supportsRVVJoinedUnitGather(RVVRegularRepeatGatherOp operation);
 
 /// A stream accumulator defines every physical lane, including the neutral
@@ -88,6 +88,8 @@ llvm::StringRef fieldReadInstruction(mlir::Value input, ValueType result,
 /// output assembly. Address operands themselves are separate SSA live values.
 std::optional<int64_t> fieldReadTemporaryGroups(
     mlir::Value input, ValueType result, AccessAttr access, mlir::ValueRange indices);
+bool hasContiguousLayeredStreamStorage(FieldOp field, ValueType result,
+                                      LayeredStreamGeometryAttr geometry);
 
 /// Returns the bit offset of one logical field element under the declared
 /// natural or grouped/layered storage geometry.

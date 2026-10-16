@@ -267,14 +267,11 @@ weft inspect /path/to/affine --emit header
 weft link /path/to/affine --cc clang --output /path/to/affine-native
 ```
 
-四类数值 runner 使用相同 `weft.build` 和 `Deployment`。`WEFT_TARGETS` 指向仓库外的机器
-配置 JSON，按 target 名提供 `target`、`deployment`、`toolchain`、`cxx`、`defines` 与需要时的
-`ggml` 路径。`deployment` 显式声明 SSH host、目标 Python、workspace 与 CPU 列表。
-目标 Python 环境必须已安装 Weft。部署只运行调用方指定的 C++ numerical driver，保留其原有
-reference 与计时范围；不会启动模型 e2e，也不在原生 JIT 失败时自动转向 SSH。
+性能测量入口已迁至独立 `weft-bench` 工具。其外部配置指定编译器、目标 ISA、native 工具链、
+SSH/CPU 和 GGML 路径；`weft-bench op` 测编译产物，`weft-bench e2e` 分开测 prefill/decode。
+SSH、编译和部署不进入原生耗时。详见[性能开发入口](../development/benchmarking.md)。
 
-`examples/run/weft-kernel-tune.sh RUNNER TARGET KERNEL [PHASE] REPETITIONS --configs configs.json
---output /outside/selection.json` 读取 `Config.to_dict()` 对象列表并调用同一个公共 `Study`。
-driver 自己检查数值并报告 native median，SSH、编译和部署耗时不进入样本。每候选的 driver 只
-构建一次，重复计时仍初始化独立输入；该计时范围在结果中明确标为 `numerical-driver-native-median-ns`。
-普通 runner 的 `--config` 接受一项 Config，`--selection` 接受保存结果并检查完整 workload/目标身份。
+Weft 主线继续拥有 `Study`、`TuningPolicy`、`Config`、JIT、artifact/package 和 `Deployment`。
+公共调优使用示例见 `examples/use.py` 与 `examples/repro/weft/torch_autotune.py`；bench 的实现配置
+可通过 `selection` 读取一个已选定的 `TuningResult`，或通过 `compile_options` 指定完整配置。
+主线不依赖 bench，也不需要安装 bench 才能编译、调优或部署。

@@ -309,7 +309,8 @@ axis relation、Encoding mapping、typed conversion关系、effect/alias/order�
 结构固定后的 LMUL、schema 内 physical microtile extent、unroll、pipeline depth、buffer count、
 local memory-leaf variant和prefetch distance。target提供有限合法域，tuner通过实测选择；非法绑定
 在emission前拒绝。当前RISC-V compiler API暴露LMUL、unroll、pipeline depth和boolean
-scalar-load-prime；后者只适用于已经证明为单window grouped/layered partial supply的local leaf。
+scalar-load-prime；后者适用于已证明的单 window grouped/layered partial supply，或完整的
+二至四 atom 连续 byte fragment supply，均只在当前局部读取范围内选择固定指令序列。
 depth=2固定导出两个buffer，prefetch固定为0，后二者还不是独立可调域。
 
 ## 14. Target profile

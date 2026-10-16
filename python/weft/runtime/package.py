@@ -64,6 +64,14 @@ class Package:
                     from weft.integrations.llama_cpp import validate_vec_dot
 
                     validate_vec_dot(kernels[name], role)
+                elif group == "ggml.from_float":
+                    from weft.integrations.llama_cpp import validate_quantizer
+
+                    validate_quantizer(kernels[name], role)
+                elif group == "ggml.ime1":
+                    from weft.integrations.llama_cpp import validate_ime1
+
+                    validate_ime1(kernels[name], role)
         destination = Path(directory).expanduser().absolute()
         destination.parent.mkdir(parents=True, exist_ok=True)
         if destination.exists():

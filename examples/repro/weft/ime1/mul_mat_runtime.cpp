@@ -1,8 +1,10 @@
 #include "../../ggml/ime1/contract.h"
+#include "spacemit/ime_kernels.h"
 
 #include <cfenv>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <dlfcn.h>
 #include <memory>
 #include <sched.h>
@@ -66,7 +68,9 @@ bool invoke(Function function, Arguments... arguments) {
 }
 
 template <class Pack, class Kernel>
-int run_case(const ime_case *selected, std::size_t repetitions, Pack pack, Kernel kernel) {
+int run_case(const ime_case *selected, std::size_t repetitions, Pack pack, Kernel kernel,
+             double fixed_baseline_us = 0, bool prequantized = false,
+             const char *execution = "artifact-call") {
   if (!selected || !pack || std::fegetround() != FE_TONEAREST) {
     std::fprintf(stderr, "a declared IME1 case, pack callable and RNE are required\n");
     return 2;
@@ -102,9 +106,44 @@ int run_case(const ime_case *selected, std::size_t repetitions, Pack pack, Kerne
     activation[i] = static_cast<float>(static_cast<int>(i % 17) - 8) / 9.0F;
   std::vector<std::uint8_t> quantized(36 * selected->m * (kK / 32), 0xA5);
   std::vector<double> samples;
+  std::vector<double> native_samples;
   double max_absolute = 0.0, max_relative = 0.0;
   if (kernel) {
     const auto expected = reference_output(*selected, expected_weights, activation);
+    std::vector<std::uint8_t> native_quantized(quantized.size());
+    std::vector<float> native_output(output.size());
+    auto quantize_native = [&] {
+      const std::size_t rows = selected->m == 1 ? 1 : 4;
+      for (std::size_t m = 0; m < selected->m; m += rows) {
+        auto *xq = native_quantized.data() + m * (kK / 32) * 36;
+        const auto *x = activation.data() + m * kK;
+        if (rows == 4)
+          spacemit_kernels::ime1::quantize_a_4row_i8(32, x, kK, xq);
+        else
+          spacemit_kernels::ime1::quantize_a_row_i8(32, x, kK, xq);
+      }
+    };
+    if (prequantized) {
+      quantize_native();
+      quantized = native_quantized;
+    }
+    auto run_native = [&] {
+      if (!prequantized) quantize_native();
+      const std::size_t rows = selected->m == 1 ? 1 : 4;
+      for (std::size_t m = 0; m < selected->m;) {
+        const auto handled = spacemit_kernels::ime1::gemm_kernel_i8i4(
+            32, native_quantized.data() + m * (kK / 32) * 36, packed.data(),
+            selected->weight_type == GGML_TYPE_Q4_0 ? nullptr : packed.data(),
+            native_output.data() + m * kN, selected->m - m, kN, kK / 32, kN);
+        if (handled != rows) return false;
+        m += handled;
+      }
+      return true;
+    };
+    if (!run_native() || !check_activation(*selected, activation, native_quantized)) {
+      std::fprintf(stderr, "native IME activation/row contract differs\n");
+      return 1;
+    }
     if (!invoke(kernel, packed.data(), activation.data(), quantized.data(), output.data(), kN, kK, selected->m))
       return 1;
     if (!check_activation(*selected, activation, quantized)) {
@@ -112,18 +151,26 @@ int run_case(const ime_case *selected, std::size_t repetitions, Pack pack, Kerne
       return 1;
     }
     for (std::size_t i = 0; i < output.size(); ++i)
-      if (!check_value(output[i], expected[i / kN], max_absolute, max_relative)) {
+      if (!check_value(output[i], expected[i / kN], max_absolute, max_relative) ||
+          !check_value(native_output[i], expected[i / kN], max_absolute, max_relative) ||
+          !check_value(output[i], native_output[i], max_absolute, max_relative)) {
         std::fprintf(stderr, "Weft output mismatch at %zu: actual=%a expected=%a\n", i, output[i], expected[i / kN]);
         return 1;
       }
     std::vector<std::uint8_t> flush(repetitions ? kFlushBytes : 0, 1);
     for (std::size_t i = 0; i < repetitions; ++i) {
-      evict_cache(flush);
-      const auto begin = std::chrono::steady_clock::now();
-      if (!invoke(kernel, packed.data(), activation.data(), quantized.data(), output.data(), kN, kK, selected->m))
-        return 1;
-      const auto end = std::chrono::steady_clock::now();
-      samples.push_back(std::chrono::duration<double, std::micro>(end - begin).count());
+      for (int side = 0; side < 2; ++side) {
+        const bool native = (i + side) % 2;
+        if (native && fixed_baseline_us > 0) continue;
+        evict_cache(flush);
+        const auto begin = std::chrono::steady_clock::now();
+        const bool ok = native ? run_native() : invoke(kernel, packed.data(), activation.data(),
+            quantized.data(), output.data(), kN, kK, selected->m);
+        const auto end = std::chrono::steady_clock::now();
+        if (!ok) return 1;
+        (native ? native_samples : samples).push_back(
+            std::chrono::duration<double, std::micro>(end - begin).count());
+      }
     }
     for (float value : output)
       if (!std::isfinite(value)) {
@@ -169,7 +216,7 @@ int run_case(const ime_case *selected, std::size_t repetitions, Pack pack, Kerne
   }
   std::printf("family=ime1\nkernel=ime1_%s\nphase=%s\n", selected->format, selected->phase);
   std::printf("execution=%s\nweight_storage=exact\nsecond_input=distinct-columns-exact\n",
-              repetitions ? "artifact-call" : "public-native-jit");
+              execution);
   if (kernel) {
     std::printf("M=%zu\nN=%zu\nK=%zu\nnumeric=within-tolerance\nactivation_storage=exact\n",
                 selected->m, kN, kK);
@@ -180,6 +227,12 @@ int run_case(const ime_case *selected, std::size_t repetitions, Pack pack, Kerne
       const double operations = 2.0 * selected->m * kN * kK;
       std::printf("repetitions=%zu\ncold_median_ms=%.6f\ncold_gops=%.6f\n", repetitions, cold_us / 1000.0,
                   operations / (cold_us * 1000.0));
+      const double baseline_us = fixed_baseline_us > 0 ? fixed_baseline_us : median(native_samples);
+      std::printf("comparison_timing=%s\n", fixed_baseline_us > 0 ? "fixed" : "measured");
+      std::printf("comparison_kind=%s\n"
+                  "comparison_median_ms=%.6f\nspeedup=%.6f\n",
+                  prequantized ? "ggml-ime1-packed-microkernel" : "ggml-ime1-quantize-and-microkernel",
+                  baseline_us / 1000.0, baseline_us / cold_us);
     }
   } else {
     std::printf("artifact_boundary=persistent-pack\n");
@@ -192,18 +245,49 @@ using kernel_callback = int (*)(const std::uint8_t *, const float *, std::uint8_
                                std::size_t, std::size_t, std::size_t);
 
 extern "C" int ime1_run_native_jit(const char *name, pack_callback pack, kernel_callback kernel) {
-  return run_case(find_case(name), 0, pack, kernel);
+  return run_case(find_case(name), 0, pack, kernel, 0, false, "public-native-jit");
 }
 
 int main(int argc, char **argv) {
+  double fixed_baseline_us = 0;
+  if (argc >= 3 && std::strcmp(argv[argc - 2], "--baseline-ms") == 0) {
+    char *end = nullptr;
+    fixed_baseline_us = std::strtod(argv[argc - 1], &end) * 1000;
+    if (!*argv[argc - 1] || *end || !std::isfinite(fixed_baseline_us) || fixed_baseline_us <= 0) {
+      std::fprintf(stderr, "baseline-ms must be finite and positive\n");
+      return 2;
+    }
+    argc -= 2;
+  }
+  size_t requested_m = 0;
+  if (argc >= 5 && std::strcmp(argv[argc - 4], "--shape") == 0) {
+    requested_m = parse_repetitions(argv[argc - 3]);
+    kN = parse_repetitions(argv[argc - 2]);
+    kK = parse_repetitions(argv[argc - 1]);
+    if (!requested_m || !kN || !kK || kN % 16 || kK % 32) {
+      std::fprintf(stderr, "shape requires positive M N K with complete N16/K32 cohorts\n");
+      return 2;
+    }
+    argc -= 4;
+  }
   if (argc != 5 && argc != 7) {
-    std::fprintf(stderr, "usage: %s <case> <repetitions> <pack.so> <pack-symbol> [<kernel.so> <kernel-symbol>]\n", argv[0]);
+    std::fprintf(stderr, "usage: %s <case> <repetitions> <pack.so> <pack-symbol> [<kernel.so> <kernel-symbol>] [--shape M N K] [--baseline-ms verified-median]\n", argv[0]);
     return 2;
   }
   const auto *selected = find_case(argv[1]);
   const std::size_t repetitions = parse_repetitions(argv[2]);
   if (!selected || !repetitions)
     return 2;
+  auto shape = *selected;
+  if (requested_m) {
+    if ((shape.m == 1 ? requested_m != 1 : requested_m % 4 != 0) ||
+        kK % ggml_blck_size(shape.weight_type)) {
+      std::fprintf(stderr, "shape differs from the selected activation/weight block contract\n");
+      return 2;
+    }
+    shape.m = requested_m;
+    selected = &shape;
+  }
   void *pack_library = dlopen(argv[3], RTLD_NOW | RTLD_LOCAL);
   if (!pack_library) {
     std::fprintf(stderr, "%s\n", dlerror());
@@ -232,7 +316,7 @@ int main(int argc, char **argv) {
       return 1;
     }
   }
-  const int result = run_case(selected, repetitions, pack, kernel);
+  const int result = run_case(selected, repetitions, pack, kernel, fixed_baseline_us);
   if (kernel_library)
     dlclose(kernel_library);
   dlclose(pack_library);

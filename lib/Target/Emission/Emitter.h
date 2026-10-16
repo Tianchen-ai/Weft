@@ -945,6 +945,8 @@ private:
   mlir::LogicalResult compileRVVTileSegmentStore(riscv::RVVTileStoreOp operation);
   mlir::LogicalResult compileRVVTileContract(riscv::RVVTileContractOp operation);
   mlir::LogicalResult compileRVVFMAIssue(riscv::RVVFMAIssueOp operation);
+  mlir::LogicalResult compileFMA(riscv::FMAOp operation);
+  mlir::LogicalResult compileRVVIntegerMAC(riscv::RVVIntegerMACOp operation);
   mlir::LogicalResult compileAtomicRMW(riscv::AtomicRMWOp operation);
   mlir::LogicalResult compileBitcast(riscv::BitcastOp operation);
   mlir::LogicalResult compileRVVStreamReduceStep(

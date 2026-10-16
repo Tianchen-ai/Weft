@@ -11,6 +11,9 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#if defined(__linux__)
+#include <sched.h>
+#endif
 
 namespace weft::runtime {
 
@@ -35,8 +38,16 @@ weft_dtype dtype(const std::string &name);
 struct Context {
   RISCVNativeTarget native;
   std::string json;
+#if defined(__linux__)
+  cpu_set_t allowedCPUs;
+  std::map<std::string, cpu_set_t> extensionCPUs;
+#endif
   Context();
+  void requireAvailable(const std::vector<std::string> &extensions) const;
   void check(const std::vector<std::string> &extensions) const;
+  void bindThread(const std::vector<std::string> &extensions) const;
+private:
+  void verifyThread(const std::vector<std::string> &extensions, bool bind) const;
 };
 
 struct Argument {

@@ -8,6 +8,7 @@
 #include "IME/FragmentMaterialization.h"
 
 #include "Weft/Dialect/RISCV/IR/RISCVDialect.h"
+#include "Weft/Dialect/RISCV/IR/Layout.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -20,6 +21,7 @@
 #include "llvm/ADT/STLExtras.h"
 
 #include <memory>
+#include <numeric>
 #include <functional>
 #include <initializer_list>
 #include <limits>
@@ -1639,6 +1641,63 @@ private:
           physicalResultType = fusedFreeAxisReduce.getResult().getType();
           laneResultType = {};
         }
+        // A complete integer contraction has one issue domain. Reconcile its
+        // numeric operands at the use edge, preserving storage/index producer
+        // layouts. Moving reduced replicas to time must cover every coordinate;
+        // treating them as independent output replicas would drop contributions.
+        if (!laneResultType && physicalReductionAxes.size() > 1 && lhsType && rhsType &&
+            lhsType.getShape() == rhsType.getShape() && lhsType.getAxisIds() == rhsType.getAxisIds() &&
+            lhsType.getAxisIds().size() == physicalReductionAxes.size() &&
+            lhsType.getLayout().getCarrier() == "rvv" && rhsType.getLayout().getCarrier() == "rvv" &&
+            lhsType.getLayout().getValidity() == "full" && rhsType.getLayout().getValidity() == "full" &&
+            lhsType.getLayout().getSew() == rhsType.getLayout().getSew() &&
+            llvm::all_of(lhsType.getAxisIds().asArrayRef(), [&](int64_t axis) {
+              return llvm::is_contained(physicalReductionAxes, axis);
+            })) {
+          llvm::SmallVector<int64_t> lanes, time, ones(lhsType.getShape().size(), 1);
+          bool complete = lhsType.getLayout().getReplicaGroup() == 1 && rhsType.getLayout().getReplicaGroup() == 1;
+          for (size_t i = 0; i < lhsType.getShape().size(); ++i) {
+            const int64_t lane = std::gcd(lhsType.getLayout().getLaneFactors()[i],
+                                          rhsType.getLayout().getLaneFactors()[i]);
+            const int64_t extent = lhsType.getShape()[i];
+            complete &= lane > 0 && extent > 0 && extent % lane == 0 &&
+                lhsType.getLayout().getFragmentFactors()[i] == 1 && rhsType.getLayout().getFragmentFactors()[i] == 1 &&
+                lhsType.getLayout().getLocalFactors()[i] == 1 && rhsType.getLayout().getLocalFactors()[i] == 1;
+            lanes.push_back(lane);
+            time.push_back(lane > 0 ? extent / lane : 0);
+          }
+          const int64_t vl = riscv_internal::staticProduct(lanes).value_or(-1);
+          riscv::LayoutAttr common;
+          for (int64_t lmul : target.getLegalLMULEighths().asArrayRef()) {
+            if (!complete || vl <= 0 ||
+                !llvm::is_contained(target.getLegalLMULEighths().asArrayRef(), 2 * lmul)) continue;
+            auto candidate = riscv::LayoutAttr::get(rewriter.getContext(), "rvv", lhsType.getAxisIds(),
+                riscv_internal::integers(rewriter, time), riscv_internal::integers(rewriter, lanes),
+                riscv_internal::integers(rewriter, ones), riscv_internal::integers(rewriter, ones),
+                riscv_internal::integers(rewriter, ones), lhsType.getLayout().getSew(), lmul, vl,
+                std::max<int64_t>(1, (lmul + 7) / 8), "full");
+            if (riscv::supportsRVVLayout(target, candidate)) { common = candidate; break; }
+          }
+          if (common) {
+            auto left = mlir::cast<riscv::ValueType>(riscv_internal::withLayout(lhsType, common));
+            auto right = mlir::cast<riscv::ValueType>(riscv_internal::withLayout(rhsType, common));
+            if (riscv::rvvLayoutRepackSlices(lhsType, left) && riscv::rvvLayoutRepackSlices(rhsType, right)) {
+              auto convert = [&](mlir::Value &value, riscv::ValueType &type, riscv::ValueType next) {
+                if (type == next) return;
+                rewriter.setInsertionPoint(operation);
+                auto converted = rewriter.create<riscv::ConvertLayoutOp>(operation->getLoc(), next, value,
+                    riscv_internal::conversion(rewriter, "lane_repack", "pure",
+                        riscv::rvvLayoutRepackTemporaryGroups(target, type, next)),
+                    riscv::AccessAttr(), riscv_internal::unselectedLeaf(rewriter));
+                copyIdentity(operation, converted);
+                value = converted.getResult();
+                type = next;
+              };
+              convert(lhsValue, lhsType, left);
+              convert(rhsValue, rhsType, right);
+            }
+          }
+        }
         auto lhsLaneSlices =
             lhsType ? planWidenDotLaneSlices(lhsType, laneResultType,
                                              physicalReductionAxes, target)
@@ -1647,6 +1706,40 @@ private:
             rhsType ? planWidenDotLaneSlices(rhsType, laneResultType,
                                              physicalReductionAxes, target)
                     : std::nullopt;
+        // A packed source may supply an m1 slice while an equally sized
+        // storage window uses a fractional register. Give that window an
+        // explicit m1 carrier; its logical lanes and register residency stay
+        // unchanged, and both operands then use the same widening instruction.
+        if (lhsLaneSlices && rhsLaneSlices &&
+            lhsLaneSlices->reductionLanes == rhsLaneSlices->reductionLanes &&
+            lhsLaneSlices->reductionStreams == rhsLaneSlices->reductionStreams &&
+            lhsLaneSlices->sliceLmulEighths != rhsLaneSlices->sliceLmulEighths &&
+            std::max(lhsLaneSlices->sliceLmulEighths,
+                     rhsLaneSlices->sliceLmulEighths) == 8) {
+          auto extendFractional = [&](mlir::Value &value, riscv::ValueType &type) {
+            auto layout = type.getLayout();
+            if (layout.getLmulEighths() >= 8) return;
+            auto extended = riscv::LayoutAttr::get(
+                rewriter.getContext(), layout.getCarrier(), layout.getAxisIds(),
+                layout.getTimeFactors(), layout.getLaneFactors(),
+                layout.getReplicaFactors(), layout.getFragmentFactors(),
+                layout.getLocalFactors(), layout.getSew(), 8, layout.getVl(),
+                layout.getRegisterGroups(), layout.getValidity());
+            if (!riscv::supportsRVVLayout(target, extended)) return;
+            type = mlir::cast<riscv::ValueType>(riscv_internal::withLayout(type, extended));
+            rewriter.setInsertionPoint(operation);
+            auto conversion = rewriter.create<riscv::ConvertLayoutOp>(
+                operation->getLoc(), type, value,
+                riscv_internal::layoutConversion(rewriter, layout, extended),
+                riscv::AccessAttr(), riscv_internal::unselectedLeaf(rewriter));
+            copyIdentity(operation, conversion);
+            value = conversion.getResult();
+          };
+          extendFractional(lhsValue, lhsType);
+          extendFractional(rhsValue, rhsType);
+          lhsLaneSlices = planWidenDotLaneSlices(lhsType, laneResultType, physicalReductionAxes, target);
+          rhsLaneSlices = planWidenDotLaneSlices(rhsType, laneResultType, physicalReductionAxes, target);
+        }
         const int64_t partialLMUL =
             lhsLaneSlices
                 ? product({lhsLaneSlices->sliceLmulEighths, int64_t{2}})
@@ -1933,8 +2026,27 @@ private:
       }
       auto lower = rewriter.create<mlir::arith::ConstantIndexOp>(operation->getLoc(), 0);
       auto step = rewriter.create<mlir::arith::ConstantIndexOp>(operation->getLoc(), schedule.getUnroll());
+      // Within a closed integer contraction, two independent partials preserve
+      // modular addition while shortening the unrolled MAC dependency chain.
+      // Bound the extra residency to two register groups; the complete live
+      // program still goes through ordinary resource materialization.
+      const bool independent = mlir::isa<mlir::IntegerType>(element) &&
+          layout.getValidity() == "full" && layout.getRegisterGroups() <= 2 &&
+          schedule.getUnroll() >= 2 && schedule.getUnroll() % 2 == 0 &&
+          staticExtent && *staticExtent >= schedule.getUnroll();
+      llvm::SmallVector<mlir::Value> seeds{initial};
+      if (independent) {
+        auto zero = rewriter.create<riscv::ConstantOp>(operation->getLoc(), element,
+            mlir::cast<mlir::TypedAttr>(rewriter.getZeroAttr(element)));
+        auto seed = rewriter.create<riscv::RVVSplatOp>(operation->getLoc(), resultType, zero,
+            riscv_internal::leaf(rewriter, "rvv", "splat", "rvv.splat", "rvv.splat", 0,
+                                 layout.getRegisterGroups()));
+        copyIdentity(operation, zero);
+        copyIdentity(operation, seed);
+        seeds.push_back(seed);
+      }
       auto loop = rewriter.create<mlir::scf::ForOp>(operation->getLoc(), lower, upper, step,
-                                                   mlir::ValueRange{initial});
+                                                   seeds);
       loop->setAttr("weft.riscv.direction", rewriter.getStringAttr("ascending"));
       loop->setAttr("weft.riscv.system_unroll", rewriter.getStringAttr("disable"));
       copyIdentity(operation, loop);
@@ -2045,9 +2157,10 @@ private:
 
       auto stepLeaf = riscv_internal::leaf(rewriter, "rvv", "contract-step",
           instruction, instruction, 0, 0, 0, 0, "none", "agnostic", over.asArrayRef());
-      mlir::Value carried = loop.getRegionIterArg(0);
+      llvm::SmallVector<mlir::Value> partials(loop.getRegionIterArgs());
       bool invalid = false;
       for (int64_t offset = 0; offset < schedule.getUnroll(); ++offset) {
+        mlir::Value &carried = partials[offset % partials.size()];
         mlir::Value index = loop.getInductionVar();
         if (offset) {
           auto delta = rewriter.create<mlir::arith::ConstantIndexOp>(operation->getLoc(), offset);
@@ -2090,11 +2203,19 @@ private:
         } else carried = next;
       }
       if (invalid) { failed = true; continue; }
-      rewriter.create<mlir::scf::YieldOp>(operation->getLoc(), carried);
+      rewriter.create<mlir::scf::YieldOp>(operation->getLoc(), partials);
+      rewriter.setInsertionPointAfter(loop);
+      mlir::Value combined = loop.getResult(0);
+      if (independent) {
+        auto add = rewriter.create<riscv::BinaryOp>(operation->getLoc(), resultType,
+            combined, loop.getResult(1), "add", riscv_internal::unselectedLeaf(rewriter));
+        copyIdentity(operation, add);
+        combined = add;
+      }
       if (fusedAdd) {
-        rewriter.replaceOp(fusedAdd, loop.getResults());
+        rewriter.replaceOp(fusedAdd, combined);
         rewriter.eraseOp(operation);
-      } else rewriter.replaceOp(operation, loop.getResults());
+      } else rewriter.replaceOp(operation, combined);
     }
   }
 

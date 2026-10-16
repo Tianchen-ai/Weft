@@ -13,7 +13,7 @@ llvm::ArrayRef<weft::RISCVFragmentCapability> fragmentContracts() {
       {"ime1-i8-n4-k8-transposed", {1, 0}, 4, 8,
        "row_major", "row_major", 8, 32},
       {"ime1-i32-m4-n4", {0, 1}, 4, 4, "row_major", "row_major", 32, 32},
-      1, 1, {"t0"}, true, false,
+      1, 1, {"t0", "vl", "vtype"}, true, false,
       0, 0, 0, 1, 2, RISCVFragmentSignedness::Signed, 4}, {
       RISCVFragmentInstruction::SpacemitIME1I8MMA,
       "spacemit-ime1-i8-m1-mma", "spacemit-ime1", 64, 256,
@@ -23,7 +23,7 @@ llvm::ArrayRef<weft::RISCVFragmentCapability> fragmentContracts() {
       {"ime1-i8-n4-k8-transposed", {1, 0}, 4, 8,
        "row_major", "row_major", 8, 32},
       {"ime1-i32-m1-n4", {0, 1}, 1, 4, "row_major", "row_major", 32, 16},
-      1, 1, {"t0"}, true, false,
+      1, 1, {"t0", "vl", "vtype"}, true, false,
       0, 0, 0, 1, 2, RISCVFragmentSignedness::Signed, 1}};
   return capabilities;
 }

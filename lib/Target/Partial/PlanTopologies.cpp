@@ -367,9 +367,9 @@ public:
         }
       if (kind.empty())
         if (auto found = scaledFacts.find(dot.getOperation());
-            found != scaledFacts.end()) {
-          const unsigned operandBits =
-              riscv_internal::logicalBitWidth(dot.getLhs().getType().getElementType());
+            found != scaledFacts.end() &&
+            (dot.getReductionStreams() == 1 || fused)) {
+          const int64_t operandBits = dot.getLhs().getType().getLayout().getSew();
           const bool oneScaleGroupFillsVector =
               kernel && operandBits && dot.getReductionLanes() > 0 &&
               dot.getReductionLanes() * static_cast<int64_t>(operandBits) >=
@@ -380,7 +380,7 @@ public:
           // scaled there, and is reduced only after the selected combine tree.
           // Scale dominance across a source Level is a legality fact, not a
           // reason to force either topology.
-          const bool reduceBeforeScale = oneScaleGroupFillsVector;
+          const bool reduceBeforeScale = oneScaleGroupFillsVector || streams > 1;
           kind = reduceBeforeScale ? "reduced_scaled" : "scaled";
           partialAxes = found->second.partialAxes;
           outputAxes = found->second.outputAxes;
@@ -389,7 +389,9 @@ public:
           combineArity = partialSlots;
           resources =
               std::max<int64_t>(1, partialSlots * partialGroups + 2);
-          if (auto source = planScaledSourceLanes(builder, dot, found->second)) {
+          if (auto source = dot.getReductionStreams() == 1
+                                ? planScaledSourceLanes(builder, dot, found->second)
+                                : std::optional<SourceLanePlan>()) {
             if (!reduceBeforeScale)
               kind = "scaled";
             sourceSlots = source->sourceSlots;
@@ -462,8 +464,10 @@ public:
       // before materialization.  Fused and per-stream realizations share the
       // same carrier; they differ only in whether the carrier or the finalized
       // i32 value crosses an issue boundary.
+      const bool scaledIssues = kind == "reduced_scaled" && streams > 1;
+      const bool collectIssues = kind == "level_scaled" || scaledIssues;
       if (kind == "sequential_fused" || kind == "sequential_per_stream" ||
-          kind == "level_scaled") {
+          collectIssues) {
         sequentialLhsIssue =
             sequentialIssueType(builder, dot, dot.getLhs().getType());
         sequentialRhsIssue =
@@ -536,7 +540,7 @@ public:
           signalPassFailure();
           return;
         }
-        if (kind != "level_scaled")
+        if (!collectIssues)
           resources = plannedResources;
       }
 
@@ -711,7 +715,7 @@ public:
                                                       : empty), selectedRepackLeaf));
 
       if (kind == "sequential_fused" || kind == "sequential_per_stream" ||
-          kind == "level_scaled") {
+          collectIssues) {
         auto lhsIssue = sequentialLhsIssue;
         auto rhsIssue = sequentialRhsIssue;
         auto accumulator = sequentialAccumulator;
@@ -739,7 +743,7 @@ public:
                 : 0;
         if (!sequentialPlanClosed || !lhsIssue || !rhsIssue || !accumulator ||
             !accumulatorElement ||
-            (kind != "level_scaled" && plannedResources != resources) || !kernel ||
+            (!collectIssues && plannedResources != resources) || !kernel ||
             plannedResources > kernel.getTarget().getVectorRegisters()) {
           dot.emitError(
               "selected sequential topology has no closed issue-slice and accumulator plan");
@@ -747,12 +751,12 @@ public:
           return;
         }
         const llvm::StringRef realization =
-            kind == "level_scaled"
+            collectIssues
                 ? llvm::StringRef("fused_partial")
                 : kind == "sequential_fused" ? llvm::StringRef("fused")
                                               : llvm::StringRef("per_stream");
         const llvm::StringRef finalizeInstruction =
-            kind == "level_scaled"
+            collectIssues
                 ? llvm::StringRef("none")
                 : accumulatorElement.getWidth() == 16
                       ? llvm::StringRef("rvv.vwredsum.partial")

@@ -3992,6 +3992,24 @@ mlir::LogicalResult ExtractOp::verify() {
     return emitOpError("physical extract requires typed selectors and result");
   auto pattern = getOperation()->getAttrOfType<mlir::DenseI64ArrayAttr>(
       "index_pattern");
+  if (pattern && getAccess().getForm() == "register") {
+    auto result = mlir::dyn_cast<ValueType>(getResult().getType());
+    auto indices = rvvRegularGatherIndices(getInput().getType(), result, pattern.asArrayRef());
+    auto baseType = getIndices().size() == 1
+        ? mlir::dyn_cast<mlir::IntegerType>(getIndices().front().getType())
+        : mlir::IntegerType();
+    if (!indices || getSelectors().size() != 1 ||
+        mlir::cast<mlir::StringAttr>(getSelectors()[0]).getValue() != "regular" ||
+        getIndices().size() > 1 ||
+        (!getIndices().empty() && !getIndices().front().getType().isIndex() &&
+         (!baseType || !baseType.isUnsigned())))
+      return emitOpError("regular register gather requires one uniform scalar index per complete carrier");
+    if (getLeaf().getEngine() != "unselected" &&
+        (getLeaf().getParameters().asArrayRef() != llvm::ArrayRef<int64_t>(*indices) ||
+         !exactLeaf(getLeaf(), "rvv", "extract", "rvv.extract.regular-scalar", "none", "exact")))
+      return emitOpError("regular register gather leaf must match its carrier index mapping");
+    return verifyLeafOperation(*this);
+  }
   if (pattern) {
     auto input = getInput().getType();
     auto result = mlir::dyn_cast<ValueType>(getResult().getType());
@@ -5331,10 +5349,12 @@ mlir::LogicalResult ConvertLayoutOp::verify() {
       kind == "rvv_to_fragment" || kind == "fragment_to_rvv")
     return emitOpError() << "convert_layout kind '" << kind
                          << "' does not match " << source << " -> " << target;
-  if (kind == "lane_repack" &&
-      (!rvvLayoutRepackSlices(input, result) ||
-       getConversion().getTemporaryGroups() != rvvLayoutRepackTemporaryGroups(input, result)))
-    return emitOpError("lane repack requires a bounded complete ordered slice relation and its temporary resources");
+  if (kind == "lane_repack") {
+    auto kernel = getOperation()->getParentOfType<KernelOp>();
+    if (!kernel || !rvvLayoutRepackSlices(input, result) ||
+        getConversion().getTemporaryGroups() != rvvLayoutRepackTemporaryGroups(kernel.getTarget(), input, result))
+      return emitOpError("lane repack requires a bounded complete ordered slice relation and its temporary resources");
+  }
   if (source == "scalar" && target == "rvv" &&
       kind == "register_to_lane") {
     auto sourceLayout = input.getLayout();
@@ -6842,11 +6862,14 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
   auto combinePartialPlan =
       (*this)->getAttrOfType<PartialCombinePlanAttr>("partial_combine_plan");
   const bool topologyAssigned = topologyKind != "unassigned";
+  const bool scaledIssues =
+      topologyKind == "reduced_scaled" && getReductionStreams() > 1;
+  const bool collectsPartials = topologyKind == "level_scaled" || scaledIssues;
   const bool sequentialPlanRequired =
       getReductionStreams() > 0 &&
       (topologyKind == "sequential_fused" ||
        topologyKind == "sequential_per_stream" ||
-       topologyKind == "level_scaled");
+       collectsPartials);
   // LowerRISCVComposites creates a legal but deliberately unassigned physical
   // contraction.  The topology pass owns every plan attribute and the final
   // verifier rejects any surviving unassigned op.  Do not require a topology
@@ -7133,6 +7156,14 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
              issue.getLayout().getVl() == getReductionLanes();
     };
     bool laneOffsetsClosed =
+        sequentialPartialPlan.getLhsSourceParts().asArrayRef() == getLhsParts() &&
+        sequentialPartialPlan.getRhsSourceParts().asArrayRef() == getRhsParts() &&
+        sequentialPartialPlan.getLhsSourceParts().size() ==
+            static_cast<size_t>(outputParts * issueCount) &&
+        sequentialPartialPlan.getRhsSourceParts().size() ==
+            static_cast<size_t>(outputParts * issueCount) &&
+        getLhsLaneOffsets().size() == static_cast<size_t>(outputParts) &&
+        getRhsLaneOffsets().size() == static_cast<size_t>(outputParts) &&
         sequentialPartialPlan.getLhsLaneOffsets().size() ==
             sequentialPartialPlan.getLhsSourceParts().size() &&
         sequentialPartialPlan.getRhsLaneOffsets().size() ==
@@ -7148,7 +7179,7 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
                   getRhsLaneOffsets()[output];
         }
     const llvm::StringRef expectedRealization =
-        topologyKind == "level_scaled"
+        collectsPartials
             ? llvm::StringRef("fused_partial")
             : topologyKind == "sequential_fused"
                   ? llvm::StringRef("fused")
@@ -7175,7 +7206,11 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
             static_cast<size_t>(issueCount * outputParts) &&
         *lhsIssueParts == 1 && *rhsIssueParts == 1 && laneOffsetsClosed &&
         sourceMatchesIssue(lhs, lhsIssue) && sourceMatchesIssue(rhs, rhsIssue) &&
-        (topologyKind == "level_scaled" ||
+        (!collectsPartials ||
+         ((issueCount == 1 || getFusedStreamsLegal()) && partialLayoutPlan &&
+          accumulator == partialLayoutPlan.getPartialSlotType())) &&
+        (!scaledIssues || getPartialTopology().getLaneSplit() == 1) &&
+        (collectsPartials ||
          getPartialTopology().getResourceGroups() ==
              sequentialPartialPlan.getResourceGroups()) &&
         sequentialPartialPlan.getResourceGroups() <= target.getVectorRegisters();
@@ -7292,8 +7327,8 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
   return mlir::success();
 }
 
-bool weft::riscv::supportsRVVWidenAdd(TargetAttr target, ValueType lhs,
-                                     ValueType rhs, ValueType result) {
+bool weft::riscv::supportsRVVWidenBinary(TargetAttr target, ValueType lhs,
+                                       ValueType rhs, ValueType result) {
   if (!target || !lhs || lhs != rhs || !result)
     return false;
   auto narrow = mlir::dyn_cast<mlir::IntegerType>(lhs.getElementType());
@@ -7331,7 +7366,7 @@ mlir::LogicalResult RVVWidenAddOp::verify() {
                                           ? "rvv.vwaddu.vv" : "rvv.vwadd.vv";
   const llvm::StringRef tail = getResult().getType().getLayout().getValidity() == "tail"
                                    ? "agnostic" : "exact";
-  if (!kernel || !supportsRVVWidenAdd(kernel.getTarget(), getLhs().getType(),
+  if (!kernel || !supportsRVVWidenBinary(kernel.getTarget(), getLhs().getType(),
                                       getRhs().getType(), getResult().getType()) ||
       !exactLeaf(getLeaf(), "rvv", "widen-add", instruction, "none", tail))
     return emitOpError(
@@ -7352,7 +7387,7 @@ mlir::LogicalResult RVVNarrowShiftRightOp::verify() {
   const int64_t operandGroups = input.getLayout().getRegisterGroups() +
       (vectorAmount ? result.getLayout().getRegisterGroups() : 0);
   if (!kernel || !element || !element.isUnsigned() ||
-      !supportsRVVWidenAdd(kernel.getTarget(), result, result, input) ||
+      !supportsRVVWidenBinary(kernel.getTarget(), result, result, input) ||
       (!vectorAmount && getAmount().getType() != input.getElementType()) ||
       !exactLeaf(getLeaf(), "rvv", "narrow-shift-right", instruction, "none", tail) ||
       getLeaf().getOperandGroups() != operandGroups ||
@@ -7795,7 +7830,7 @@ mlir::LogicalResult RVVRegularRepeatScalarLoadOp::verify() {
       resultAxis == result.getAxisIds().asArrayRef().end() ||
       getAccess() != sourceField.getAccess() ||
       (!natural && !joined) || getAccess().getBitOffset() % 8 ||
-      !scalarSourceBase || getSourceCount() <= 0 || getRepeat() <= 1 ||
+      !scalarSourceBase || getSourceCount() <= 0 || getRepeat() <= 0 ||
       result.getElementType() != field.getElementType() ||
       result.getLayout().getCarrier() != "scalar" || !timeParts || !replicas ||
       *timeParts > std::numeric_limits<int64_t>::max() / *replicas ||
@@ -7809,12 +7844,14 @@ mlir::LogicalResult RVVRegularRepeatScalarLoadOp::verify() {
   const size_t resultPosition = static_cast<size_t>(
       resultAxis - result.getAxisIds().asArrayRef().begin());
   const int64_t lanes = result.getLayout().getLaneFactors()[resultPosition];
+  const bool flatWindow = natural && getRepeat() == 1 &&
+      result.getShape().size() > 1;
   if (getSourceCount() >
       std::numeric_limits<int64_t>::max() / getRepeat())
     return emitOpError("regular-repeat scalar load logical extent overflows");
   for (size_t position = 0; position < result.getShape().size(); ++position) {
     const bool validExtent =
-        position == resultPosition
+        flatWindow ? result.getShape()[position] > 0 : position == resultPosition
             ? result.getShape()[position] == getSourceCount() * getRepeat()
             : result.getShape()[position] <= 0 ||
                   result.getShape()[position] == 1;
@@ -7830,7 +7867,23 @@ mlir::LogicalResult RVVRegularRepeatScalarLoadOp::verify() {
   const int64_t sourceReplicas =
       result.getLayout().getReplicaFactors()[resultPosition];
   llvm::SmallVector<int64_t> expectedPartBases;
-  if (sourceReplicas == 1 && *replicas == 1 &&
+  if (flatWindow) {
+    auto extent = checkedPositiveProduct(result.getShape().asArrayRef());
+    auto coordinates = RegisterCoordinates::get(result.getLayout());
+    if (!extent || *extent != getSourceCount() || !coordinates ||
+        result.getLayout().getValidity() != "full" ||
+        coordinates->lanes() != 1 || coordinates->parts() != *extent ||
+        !llvm::equal(coordinates->extents(), result.getShape().asArrayRef()))
+      return emitOpError("scalar storage window must cover its complete logical domain");
+    for (int64_t part = 0; part < coordinates->parts(); ++part) {
+      auto logical = coordinates->logical(part);
+      if (!logical) return emitOpError("scalar storage window has no part coordinate");
+      int64_t offset = 0;
+      for (auto [coordinate, size] : llvm::zip(*logical, result.getShape().asArrayRef()))
+        offset = offset * size + coordinate;
+      expectedPartBases.push_back(offset);
+    }
+  } else if (sourceReplicas == 1 && *replicas == 1 &&
       *timeParts == sourceTime && lanes > 0 &&
       lanes <= getRepeat() && getRepeat() % lanes == 0) {
     expectedPartBases.reserve(sourceTime);
@@ -8209,6 +8262,8 @@ mlir::LogicalResult RVVReplicaStorageLoadOp::verify() {
   ValueType field = getField().getType();
   ValueType result = getResult().getType();
   auto sourceField = getField().getDefiningOp<FieldOp>();
+  if (!sourceField)
+    return emitOpError("requires its original encoded field projection as the storage source");
   auto storageLoad = sourceField ? sourceLoad(sourceField.getOwner()) : LoadOp();
   auto memory = storageLoad ? storageLoad.getRegion().getType() : MemDescType();
   mlir::Type fieldElement = field.getElementType();
@@ -8431,11 +8486,14 @@ mlir::LogicalResult RVVReplicaStorageLoadOp::verify() {
   } else {
     if (getAccess().getForm() != "indexed" || group <= 0 || layer <= 0 ||
         group % layer || layers <= 1 || layer % *physicalLanes ||
-        !fieldInteger || fieldInteger.isSigned() || fieldBits * layers > 8 ||
+        !fieldInteger || fieldInteger.isSigned() || fieldBits <= 0 ||
+        layers > 8 / fieldBits ||
+        (logicalSpan > group && (8 % fieldBits || layers != 8 / fieldBits)) ||
         result.getLayout().getSew() != 8 || getAccess().getBitOffset() % 8 ||
         (getAccess().getOrder() != "lo_first" &&
          getAccess().getOrder() != "hi_first") ||
-        group % logicalSpan)
+        (logicalSpan <= group ? group % logicalSpan : logicalSpan % group) ||
+        (logicalSpan > group && logicalBaseMultiple % group))
       return emitOpError(
           "layered replica storage load requires closed grouped/layered byte geometry");
   }
@@ -8448,7 +8506,9 @@ mlir::LogicalResult RVVReplicaStorageLoadOp::verify() {
                                                 plan.getProjectionStride() <
                                        logicalSpan
                              : offset >= 0 &&
-                                   offset <= layer - *physicalLanes;
+                                   offset % layer <= layer - *physicalLanes &&
+                                   offset <= (logicalSpan > group ? logicalSpan / layers : layer) -
+                                                 *physicalLanes;
     if (!bounded)
       return emitOpError("replica storage load window offset is out of bounds");
   }
@@ -8897,15 +8957,36 @@ ReloadOp singleChainReload(SpillOp spill) {
 
 mlir::Value chainValueBeforeSpill(mlir::Value value) {
   while (auto reload = value.getDefiningOp<ReloadOp>()) {
+    auto allocation = reload.getSlot().getDefiningOp<LocalAllocOp>();
+    if (!allocation || allocation.getResult().getType().getPurpose() != "spill" ||
+        allocation->getBlock() != reload->getBlock())
+      break;
     SpillOp writer;
-    for (mlir::Operation *user : reload.getSlot().getUsers())
-      if (auto spill = mlir::dyn_cast<SpillOp>(user);
-          spill && singleChainReload(spill) == reload) {
+    bool uniqueWrite = true;
+    for (mlir::Operation *user : reload.getSlot().getUsers()) {
+      if (auto spill = mlir::dyn_cast<SpillOp>(user)) {
+        if (writer || spill->getBlock() != reload->getBlock() ||
+            !allocation->isBeforeInBlock(spill) ||
+            spill.getInput().getType() != reload.getResult().getType()) {
+          uniqueWrite = false;
+          break;
+        }
         writer = spill;
+      } else if (auto other = mlir::dyn_cast<ReloadOp>(user);
+                 !other || other->getBlock() != reload->getBlock() ||
+                 other.getResult().getType() != reload.getResult().getType()) {
+        uniqueWrite = false;
         break;
       }
-    if (!writer)
+    }
+    if (!uniqueWrite || !writer ||
+        llvm::any_of(reload.getSlot().getUsers(), [&](mlir::Operation *user) {
+          return user != writer.getOperation() && !writer->isBeforeInBlock(user);
+        }))
       break;
+    // A shared seed can be spilled once and reloaded for several chains.
+    // Recovering its SSA origin does not make any accumulate result shareable:
+    // the forward closed-chain check still requires one consumer per link.
     value = writer.getInput();
   }
   return value;
@@ -10164,11 +10245,48 @@ mlir::LogicalResult RVVLayeredWindowOp::verify() {
   return mlir::success();
 }
 
+bool weft::riscv::hasContiguousLayeredStreamStorage(
+    FieldOp field, ValueType result, LayeredStreamGeometryAttr geometry) {
+  auto load = field ? sourceLoad(field.getOwner()) : LoadOp();
+  if (!load || !geometry)
+    return false;
+  auto memory = load.getRegion().getType();
+  if (memory.getInterleaveRows() == 0)
+    return true;
+  // Each window is a unit byte load within one record's field chunk. Its
+  // replicas are record rows; its streams are record-local packed layers.
+  auto access = field.getAccess();
+  auto integer = mlir::dyn_cast<mlir::IntegerType>(result.getElementType());
+  const int64_t chunk = access.getFieldChunkBytes();
+  const int64_t lanes = geometry.getLaneCount();
+  if (!integer || chunk <= 0 || lanes <= 0 || lanes > chunk ||
+      result.getShape().size() != 2 || memory.getAxisIds() != result.getAxisIds() ||
+      geometry.getAxis() != result.getAxisIds()[1] ||
+      result.getShape()[1] <= 0 ||
+      access.getStorageBits() / integer.getWidth() != result.getShape()[1] ||
+      result.getLayout().getLaneFactors()[0] != 1 ||
+      geometry.getGroupForWindow().size() != geometry.getWithinForWindow().size())
+    return false;
+  for (auto [group, within] : llvm::zip(geometry.getGroupForWindow().asArrayRef(),
+                                      geometry.getWithinForWindow().asArrayRef())) {
+    const int64_t layer = geometry.getLayerSize();
+    if (group < 0 || layer <= 0 || within < 0 || within >= layer ||
+        group > (std::numeric_limits<int64_t>::max() - within) / layer)
+      return false;
+    const int64_t byte = group * layer + within;
+    if (byte % chunk > chunk - lanes || byte > access.getStorageBits() / 8 - lanes)
+      return false;
+  }
+  return true;
+}
+
 mlir::LogicalResult RVVLayeredStreamOp::verify() {
   ValueType field = getField().getType();
   ValueType result = getResult().getType();
   auto element = mlir::dyn_cast<mlir::IntegerType>(field.getElementType());
   auto sourceField = getField().getDefiningOp<FieldOp>();
+  if (!hasContiguousLayeredStreamStorage(sourceField, result, getGeometry()))
+    return emitOpError("requires unit byte windows inside the declared record or interleaved field chunk");
   const int64_t group = getAccess().getGroupSize();
   const int64_t layer = getAccess().getLayerSize();
   const int64_t layers = layer > 0 ? group / layer : 0;
@@ -10472,22 +10590,26 @@ mlir::LogicalResult ProjectReductionOperandOp::verify() {
       input.getAxisIds().asArrayRef().begin());
   const int64_t lanes = inputLayout.getLaneFactors()[reduced];
   const int64_t streams = inputLayout.getTimeFactors()[reduced];
+  const bool scalarProjection = lanes == 1 &&
+      inputLayout.getCarrier() == "scalar" && resultLayout.getCarrier() == "scalar" &&
+      inputLayout.getReplicaFactors()[reduced] > 0 && streams > 0 &&
+      (inputLayout.getReplicaFactors()[reduced] > 1 || streams > 1);
   const bool timeProjection = lanes == 1 && streams > 1 &&
-      resultLayout.getCarrier() == "rvv" &&
+      inputLayout.getCarrier() == "rvv" && resultLayout.getCarrier() == "rvv" &&
       inputLayout.getLmulEighths() == resultLayout.getLmulEighths() &&
       inputLayout.getVl() == resultLayout.getVl();
   const bool laneProjection = lanes > 1 && streams > 0 &&
+      inputLayout.getCarrier() == "rvv" &&
       resultLayout.getCarrier() == "scalar" &&
       llvm::all_of(resultLayout.getLaneFactors().asArrayRef(),
                    [](int64_t factor) { return factor == 1; }) &&
       llvm::all_of(resultLayout.getTimeFactors().asArrayRef(),
                    [](int64_t factor) { return factor == 1; });
-  if (inputLayout.getCarrier() != "rvv" ||
-      inputLayout.getSew() != resultLayout.getSew() ||
-      inputLayout.getReplicaFactors()[reduced] != 1 ||
+  if (inputLayout.getSew() != resultLayout.getSew() ||
+      (!scalarProjection && inputLayout.getReplicaFactors()[reduced] != 1) ||
       inputLayout.getFragmentFactors()[reduced] != 1 ||
       inputLayout.getLocalFactors()[reduced] != 1 ||
-      (!timeProjection && !laneProjection))
+      (!scalarProjection && !timeProjection && !laneProjection))
     return emitOpError(
         "reduction projection requires an explicit lane or time coordinate; "
         "singleton physical factors do not imply a singleton logical axis");

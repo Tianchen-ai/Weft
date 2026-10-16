@@ -57,10 +57,17 @@ std::optional<ContractStepGeometry> ContractStepGeometry::get(
   if (!lane || lane.getLayout().getCarrier() != "rvv" ||
       (scalar && scalar.getLayout().getCarrier() != "scalar")) return std::nullopt;
   ContractStepGeometry geometry;
-  geometry.floating = instruction == "rvv.vfmacc.vf";
-  geometry.widening = instruction == "rvv.vfwmacc.vf";
+  const bool integerWidening = instruction == "rvv.vwmacc.vx";
+  geometry.widening = instruction == "rvv.vfwmacc.vf" || integerWidening;
+  geometry.floating = instruction == "rvv.vfmacc.vf" || instruction == "rvv.vfwmacc.vf";
   auto outputElement = result.getElementType();
-  if (geometry.widening) {
+  if (integerWidening) {
+    auto narrow = mlir::dyn_cast<mlir::IntegerType>(element(lhs));
+    auto wide = mlir::dyn_cast<mlir::IntegerType>(outputElement);
+    if (!narrow || !wide || !narrow.isSigned() || !wide.isSigned() ||
+        narrow.getWidth() != 16 || wide.getWidth() != 32 || element(rhs) != narrow)
+      return std::nullopt;
+  } else if (geometry.widening) {
     if (!element(lhs).isF16() || !element(rhs).isF16() ||
         !outputElement.isF32()) return std::nullopt;
   } else if (geometry.floating) {
@@ -122,6 +129,8 @@ std::optional<ContractStepGeometry> ContractStepGeometry::get(
 mlir::LogicalResult RVVContractStepOp::verify() {
   auto kernel = (*this)->getParentOfType<KernelOp>();
   if (!kernel) return emitOpError("contract step must belong to a target kernel");
+  if (getLeaf().getInstruction() == "rvv.vwmacc.vx" && !kernel.getTarget().getHasWideningInteger())
+    return emitOpError("integer widening contract step requires the target capability");
   for (auto operand : getOperands())
     if (auto type = mlir::dyn_cast<ValueType>(operand.getType());
         type && type.getLayout().getCarrier() == "rvv" && !supportsRVVLayout(kernel.getTarget(), type.getLayout()))

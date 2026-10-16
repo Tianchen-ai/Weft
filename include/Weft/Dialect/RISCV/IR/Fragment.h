@@ -24,6 +24,8 @@ std::optional<AccessAttr> fragmentDenseReadAccess(mlir::Value source,
                                                 FragmentType result);
 bool supportsFragmentWordWindows(mlir::Value field, FragmentType result);
 std::optional<int64_t> fragmentPointwiseTemporaryGroups(FragmentType lhs, mlir::Type rhs);
+bool supportsFragmentByteRepeat(FragmentType fragment, ValueType rows, TargetAttr target);
+bool supportsFragmentGroupedLoad(FragmentType fragment, TargetAttr target);
 } // namespace weft::riscv
 
 #endif

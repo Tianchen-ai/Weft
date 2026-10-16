@@ -91,6 +91,12 @@ birth、handoff、effect、Encoding 与 ABI identity 必须一一保留。
 一个 physical module 只含一组 meta/unroll/pipeline binding。候选枚举和实测发生在 driver
 之外；pass pipeline 不接收列表，也不在 module 内保存备用值。
 
+转换时可用入口 View 的完整 record 与 interleave cohort 合同证明 domain 无尾部。
+证明只接受已绑定的正 partition，以及可整除的静态 extent 或同一 shape symbol 上的
+Encoding 整除约束；随后将 Physical domain 和 point 标为 `exact`。不能仅凭轴名、常见
+模型维度或样本 shape 去掉边界，slice 的局部 extent 也不继承整个入口 View 的整除性质。
+Canonical domain、遍历顺序与 runtime 维度不变；无法证明时保留原 tail 合同。
+
 ### `SelectRISCVOperations`
 
 读取 operation semantics、typed operands、axes 和 target capability，按 target 固定优先级
@@ -115,6 +121,10 @@ carrier/坐标，不重选 partial plan；新 leaf 及资源由原有 verifier/m
 target 合法性判据，memory reads 和外层 traversal 不变；其 window projection、资源重闭合
 和 terminal part 映射仍必须显式成立。
 
+已计算的一维 RVV value 被静态连续 iota 切片时，selector 证明索引加法无 wrap、窗口在
+原值域内且完整落入已选 carrier，然后物化 `rvv_issue_slice`。索引证明与布局传播共用；
+子域的较小 extent 不反向缩窄父值。该规则不重读 encoded field，也不把任意 gather 当作切片。
+
 ### `PropagateRISCVLayouts`
 
 跨 pointwise broadcast 传播的是实际保留坐标的约束。source 的 scalar tuple、memory anchor
@@ -131,6 +141,9 @@ primary lane axis 即使也由其它 use 传播到 coalesced 集合中，其 lan
 插入 `convert_layout`，op verifier 与 final verifier 均检查这个关系。
 bounded register reduction 可以保留一致的 free-axis memory supply，以 register replica
 表示被消除轴；结果必须逐轴保留其余 mapping，不强制将归约轴搬入 SIMD lane。
+当多个轴已共用 lanes、但只归约其中一轴时，先用纯 `lane_repack` 将该轴移入 register
+replicas，再执行 register reduction，保留其它 lane 坐标。单个返回 scalar 的 RVV lane
+reduction 不能实现仍有独立 lane 轴的结果。
 已实例化的 LMUL binding 是基础表示宽度，不是所有 SSA 值的统一上限。
 保持同一 logical lane span 的 cast/widen/narrow 链会按 SEW 比例唯一派生每个值的
 LMUL；同整数元素类型、同 shape/axis/lane axis 的普通逐元素 consumer 继续保留这个派生宽度，
@@ -176,6 +189,10 @@ natural/grouped-layered/joined 的完整 storage geometry。lookup table被保�
 composite lowering中消费。partial materialization后新出现的replica memory edge会再次经过
 该 pass写入typed storage relation；它最终采用unit、strided还是保留indexed，唯一由后置的
 `MaterializeRISCVReplicaStorageLoads`根据最终consumer layout决定。
+
+普通 dense load/store 的单条 unit/strided leaf 只覆盖一个 lane 轴。多轴计算 carrier 在
+memory use 上先拆成 innermost-lane carrier 与 replicas，读取后再按需合并；不能把最外轴的
+stride 用于整个合并后的 VL。转换保持原访问点、完整 shape/axes 与 memory effects。
 
 对 stride 为 ABI/runtime operand 的 dense lane axis，unit-stride 探测是局部物理选择。
 选择沿 Slice/Subview 回看底层 descriptor：只为最内层非单例维度加入该探测；被切片隐藏的
@@ -253,6 +270,10 @@ indices 做 register gather。group 为不超过128的二次幂，完整两组by
 证明并冻结为leaf参数，verifier重算；scratch固定4倍result register groups。该关系不把
 不同逻辑field当成同一field，也不移动读取越过write或unknown effect。
 
+单轴、full-valid、unit-repeat 的 joined 窗口若被拆成多个 fractional carrier，可在目标
+合法的至多 m1 carrier 内容纳同一完整逻辑窗口，再用显式 conversion 恢复 consumer
+的 lane/time mapping。原 shape 必须由 lane×time 精确覆盖，不扩大读取或改变字段轴。
+
 对一个完整 encoded field 同时有外层 RVV consumer 与内层 `group_index` scalar
 consumer 的情形，pass 只在 field owner/name、logical shape/axes、parent/sub-Level point
 几何、分组步长和重复 decode 全部一致时，在两类 use 的共同支配 Level 物化
@@ -291,12 +312,25 @@ row SSA 的广播单独物化并共享，后续 fragment pointwise 消费该已�
 同一供应共享关系也适用于单行完整 carrier。资源闭合前，纯 `lane_repack` 与返回完全相同
 type 的逆转换可以消除；这不授权穿过已选 coordinate exchange 任意重建 producer。
 
+单行 fragment 的有效 atom 小于一个硬件寄存器、完整 row 大于一个寄存器时，handoff
+可先以独立的小范围 slide 组成完整寄存器，再通过已验证的 `vset` 映射合并。自然 atom、
+中间完整寄存器及最终 row 都有显式 type/conversion；局部工作估计不将无搬运的
+`vget/vset` 子寄存器映射计为 slide，资源统计仍包含实际驻留的 parts。
+
 候选先检查 IR、坐标与共享 region-aware 驻留预算。成组采用明确的 target 规则；独立 atom
 布局按更内层 loop 的局部工作优先，平局保留现有布局。诊断分别输出请求、规则、峰值实体、
 算术与 broadcast/conversion/initializer 工作量。该估计描述 system compiler 优化前的局部
 展开，不是整个 tile 的周期预测，不包含未变化的 MMA、decode、地址计算与 memory 延迟；
 cycle estimate 明确 unavailable。未知局部工作不填零，后续 memory/leaf/resource 失败也不
 触发另一套隐藏结构的重试。
+
+### `ScheduleRISCVLocalSupplies`
+
+leaf 已选定后，在同一 block 内沿 unpack/cast 的 use-def 找到 contraction 后消费的独立
+scale supply。仅移动既有 field/read/widen/cast/mul/纯 conversion closure，至多 24 个 op；
+不改变读取次数、Level、iteration 或浮点运算树。跨越的操作必须只有读取 effect 或无 memory
+clobber 的已选 fragment MMA，随后用完整 region live set 检查 vector/fragment 容量。
+容量不足保留原顺序。调度结果写回实际 SSA 顺序，terminal emitter 不重新安排该供应。
 
 ### `CanonicalizeRISCVLayouts`
 
@@ -328,6 +362,7 @@ form 和 leaf 由后续 `PlanRISCVMemory` 重选；该规则不把寄存器 tabl
 完整的 regular-repeat gather 仅被 scalar conversion 使用时，可在原读取位置直接形成
 scalar supply，复用重复的 source byte。该规则保留归约轴及单元素 free-axis mapping，
 要求同 block、无跨写入、完整窗口与精确 part-base；不需要重物化整段坐标/算术程序。
+`repeat=1` 是每个 source 对应一个 scalar part 的合法退化情形，仍检查完整窗口与 part-base。
 
 一个单 use、无 snapshot 的一维 dense unit load，经 pure conversion 只供给一个 pointwise
 consumer 时，可以在原读取点直接采用该 consumer 要求的分片。仅接受已物化的 domain-point
@@ -362,6 +397,13 @@ allocation 和 descriptor。未闭合的动态窗口或非独占更新明确拒�
 - ordinary contract变成显式 reduction loop与 RVV step；
 - IME contract变成 typed fragment 初始化、operand supply、带 accumulator 的 MMA 与 unpack；
 - layout conversion获得唯一 terminal conversion leaf。
+
+小型、单 reduction 轴的 memory-backed integer `vx` operand 可以采用 scalar tuple，
+直接供应各次 issue 的 GPR；相应 projection 保留完整坐标，不先向量加载再逐 lane 提取。
+闭合整数 contract 在 full-valid、每个 accumulator 至多两组寄存器、偶数 unroll 且静态
+extent 至少覆盖一次展开时，物化两条交替更新的 partial chain，末尾以同宽整数加法合并。
+原有外部整数 seed 只进入第一条 chain；第二条从零开始。此重排遵守模整数加法，不跨越
+浮点或显式转换边界；新增驻留仍由完整 resource pass 核验。
 
 `DenseContractions` 在闭合浮点 operation 内枚举有限 free-axis tile 和 LMUL。选择同时计入
 实际 issue 指令、向量宽度工作、重复输入和尾块的无效工作；输入加载、转换、FMA、最终归约
@@ -495,7 +537,7 @@ loop init，可将其驻留移交给 loop carry；另一 arm 的语法 use 不�
 
 ### `RetainRISCVFragmentAccumulators`
 
-SCCP 之后识别 `unpack(MMA) + carried i32 → yield` 的单 block、single-use 关系。仅在 register
+SCCP 之后、流水切分之前识别 `unpack(MMA) + carried i32 → yield` 的单 block、single-use 关系。仅在 register
 `new(0)`、相同 domain/type、正向静态 loop trip count 与 i32 累加上界均可证明时，把该 loop
 carry 改为 FragmentType，并将 unpack 放到 loop 出口。初值仍属于同一个 New 的 birth/owner/
 lifetime，不把初始化吞成无身份的 leaf。signed-i8 的保守单步界为 `128*128*K_atom`，总步数
@@ -549,7 +591,12 @@ mask读取点、time/lane/replica、tail、下游原宽乘法均保持；取负�
 `ScheduleRISCVLevels` 是 scheduler。它读取已 lowering 的 physical `scf.for`、SSA use-def、
 loop carry 和 operation effect，把与下一迭代无关的 pure/read producer 放在 stage 0，
 把依赖 carry 并生成 yield 的 consumer 放在 stage 1，并在具体 operation 上写入
-stage/order。它不通过 op 数量、相邻关系或 window family 命名 cluster。嵌套 region、write/
+stage/order。已经数值化或具有直接 field supply 的 widening multiply/dot 与 fragment MMA
+也建立 consumer 边界，避免整段 contraction 都落入 producer、只重叠最终 scalar add。
+直接 field 在该边界前物化为 `field_read`，跨阶段传递真实 numeric value；带 shaped index 的
+storage projection 不使用这条前移规则。无 memory clobber、copy accumulator 的 MMA
+只写入新的私有 SSA fragment，其依赖链保持在 consumer stage；最终物理 reuse 仍归资源闭合。
+它不通过 op 数量、相邻关系或 window family 命名 cluster。嵌套 region、外部 write/
 unknown effect 目前没有 predication/ordering 合同，因此明确拒绝，不得重排。
 
 `PipelineRISCVLevels` 是 expander。depth 1 只消费 schedule；depth 2 消费 scheduler 写入的
@@ -567,13 +614,25 @@ conversion、无中间 write/unknown effect 时，它还能证明多个 layer �
 window。成功时都以真实 physical operation替换 extract。当前仅对 full-validity layer做共享；
 tail cohort没有证明安全时保持原程序。
 
-fragment supply 使用同一 sharing owner：在整 chunk/cohort、无 snapshot/干扰写入的前提下，
+消费 layout 的 lane span 大于 storage layer 时，可将外侧 lane factors 精确拆为 time，
+按完整 layer 宽度读取、共享 raw bytes，再用显式 `lane_repack` 恢复消费 layout。
+此规则要求 full validity、连续坐标、精确整除与合法载体；不扩大字段读取范围。
+
+fragment supply 使用同一 sharing owner：在完整 chunk/cohort、无 snapshot/干扰写入的前提下，
 将最多四次、无内部 birth/嵌套 control 的完整 layer issue 显式展开，保留 K issue 顺序与
 carry。只允许 pure/read 和已闭合 MMA 私有更新；不复制作者状态声明。随后每个 raw read
 最多比较 32 个此前候选，要求相同 field/load/parent point、child domain/active/partition、
 fragment type/access，并由相对 offset 的 group/layer 商余数证明同一 byte window。
+流水剥离后的正起点区间也可以展开，但至多四次 issue 的区间必须包含至少一个完整共享
+window；展开次数取实际上下界之差，保留原 induction coordinate 与 carry。
 共享结果是支配消费者的真实 SSA；decode 的 layer shift 不合并，完整 live set 仍由资源
 owner 核算。final resource marker 未清除时不执行这项结构改写。
+
+已物化的 replica load 若只被一组不重叠、完整覆盖的 `rvv_issue_slice` 消费，可以按
+这些已选 part 投影 supply。每个投影保留 element type、SEW、LMUL、VL、validity 和
+原有 window/decode map，只在同 block 且不跨 write/unknown effect 时移到对应 issue。
+这缩短完整输入集合的寄存器存活期；共享 raw byte 可能在不同 issue 重新读取，最终资源
+分析仍核算各个真实 load、decode 和 accumulator，不让 terminal emitter 隐式流式化整个 tuple。
 
 ### `MaterializeRISCVReplicaStorageLoads`
 
@@ -582,6 +641,11 @@ affine index、time/lane/replica分解、consumer layout与target facts，按tar
 保留indexed、unit或strided field-to-register form。成功时把extract物化为
 `rvv.replica_storage_load`；选中的op明确携带window plan、每个physical part的source window
 以及exact load leaf，layered relation不会伪装成strided load。
+
+连续 affine 索引可以覆盖多个完整 packed group。跨 group 时要求 scalar base 按 group
+对齐、各 layer 正好组成一个完整 byte，并将 group 坐标保留在 raw-byte window offset 中；
+layer 编号只取本 group 内的坐标。verifier 同时检查完整 raw span 与单个 layer 的窗口边界，
+不能对跨 group offset 只取 layer 余数。完整地址关系成立时，无需先生成向量除余和 gather。
 
 这个 pass只闭合现有 field-to-register edge，不创建logical axis、Level或source traversal。
 partial materializer若需把一个已选unit load投影到issue window，只能机械投影原有plan与leaf，
@@ -662,6 +726,9 @@ product carrier。materializer先用显式`rvv_widen_multiply/rvv_widen_accumula
 再由`rvv_partial_collect`按SSA operand顺序建立typed slot集合，之后才执行partial reduction与
 scale combine。`rvv_partial_collect`不生成新的数学运算；它使同时存活的独立product、slot顺序、
 birth/lifetime和资源总量成为可验证的IR合同，terminal translator不能从原dot重新构造这棵程序。
+该机制同时用于 Level-local 和显式 replica 的 scaled slot。多 K issue 合并进窄 accumulator
+必须有原有 `fused_streams_legal` 证明；sequential plan 保存单个 slot 的 issue 资源，scaled
+plan 保存完整 slot 集合与 scale/combine 资源，两者分别验证，不能以局部预算替代完整 live set。
 
 independent i16 partial tree 若没有同宽跨 stream 合并的合法证明，首层 pairwise combine
 必须 widening 到 i32，后续层保持 i32，再做最终 reduction；这同样适用于四路及更多
@@ -709,6 +776,14 @@ slot pack统一使用最终VL：每次slide保留已构造前缀，未构造lane
 该pass位于普通编译与layout-input恢复共用的收尾入口，并由`weft-opt`公开供重放。已带
 final resource marker的图不重新选择；独立副本须先清marker和统计后才能重放此改写。
 
+未选择 packed scale 的完整 i32/VL1 scale-combine，若有 4–8 个偶数 slot 并收敛到一个
+结果，可用两个既有 scale-combine result slots 承载独立短链，再以既有 pairwise combine
+收敛。原 slot permutation、每项 scale、整数位宽和 scale 所在位置保持不变；只重组同一
+闭合 i32 加法的物理依赖。两条链多占一个结果载体和一次向量 issue，最长 MAC 链减半，
+最终完整 live set 仍重新核算。该选择不处理浮点、未归约的 lane 或 tail，不把 scale 前移。
+参考 Triton `ReduceOpToLLVM.cpp:228-299` 在同线程 register 集合中物化 reduction tree；
+这里的节点是 CPU 的独立 partial carriers，组合拓扑显式保存在 Physical IR 中。
+
 ### `SpecializeRISCVMemory`
 
 将动态 dense stride 的局部访问候选物化为真实 `scf.if`，guard 只读取不可变的 ABI stride。
@@ -728,6 +803,11 @@ tail passthrough 的 full-step leaf；其它 step 保留未更新 lane。整块�
 及源循环的 lower/upper/step，不能用名义 shape 或期望的 benchmark 尺寸代替。
 
 ### `FinalizeRISCVLeaves`
+
+index residue 折叠后成为常量且按 layer 对齐的 base，若窗口完全位于一个 layer，可将其
+layer 坐标移入既有 decode map，base 保留 group origin。实际 byte 地址与读取范围不变，
+group 对齐证明进入 window plan；零位移与最高有效 layer 的冗余 mask 随之消失，不由
+emitter 重新判断。该折叠在资源闭合前完成，不改变 operand/result 的 layout 或 leaf 类别。
 
 此收尾还将 conversion 输入侧的 encoded 读取显式物化为 `field_read`：
 `local_load`/`time_to_lane` 的字段供应直接产生已选结果；其它转换先读取原表示，再转换 numeric SSA。
@@ -789,6 +869,8 @@ singleton shaped scale 使用显式 index-zero extract，资源继续走同一�
 vector-load leaf；`rvv_replica_storage_load`还必须只有一个source window。pass把该op的leaf改为
 对应的`scalar-prime` form，不改变type、SSA、control或storage geometry。启用但整个module没有
 合法edge时当前candidate失败，而不是把参数静默当成零。
+同一选择也覆盖送入 fragment MMA 的完整二至四 atom 连续 byte 供给；packing 与 full validity
+必须由已有 fragment storage-load 合同证明。它读取整个供给的最后一个有效 byte，再发原有 loads。
 
 这个leaf固定为同一raw window末端的一次有序scalar byte read加原vector load。它是有限的局部
 memory spelling，不携带future-iteration、distance、buffer或pipeline schedule；若需要跨iteration
@@ -810,6 +892,9 @@ shape、axes 和 Level 归属保持不变。私有 local writes 不与 pinned Vi
 只读是 effect 事实，不是推测执行许可。循环外提还须证明读取所在循环至少执行一次，并保留
 未知副作用与容量检查等执行边界；零次迭代不能因此产生新的访存。坐标构造的无内存副作用
 也不使它获得通用 Pure/CSE 权限。
+
+已知只执行一次的 physical loop 保留其原供应位置；外提不能减少动态执行次数，反而
+会延长解码后数值的驻留。该选择不删除作者 Level 或改写其 birth/handoff。
 
 快照要求静态、一维、unit-stride、完整且非 interleaved 的 record 区间；未满足的干扰读取
 必须拒绝。容量和 lifetime 由 `LocalType` 承载，资源 pass 核算分配；没有干扰的读取不增加
@@ -842,6 +927,52 @@ region-aware 资源分析的峰值不超过 target 寄存器预算时接受。�
 资源拒绝数与最大已选峰值写入候选诊断，并接入 pass statistics。这个估计不代替 effect/数值/type
 合法性，也不保证 intrinsic C 后的 LLVM 寄存器分配没有 spill；有限物理绑定仍由 kernel
 旁的配置提供并通过真实运行选择。最终资源 pass 重新核算实际选择的 Physical graph。
+
+### `ContractRISCVIntegerPointwise`
+
+对同 block、单 use 的整数位字段拼接 `(low | (high << c)) ± bias`，先证明 `low` 是
+至多 `c` 个 unsigned bits 的值，且 `0 < c < SEW`。窄 unsigned 值的数值 widening 可以提供
+这项证明；未知位域不改写。所有参与运算的 vector type 相同，bias 与 multiplier 保持同一
+元素宽度，不越过 region、write 或未知 effect。
+
+非重叠位域的 OR 等于同宽加法，因此 pass 形成真实的 `low ± bias` 与
+`rvv_integer_mac(high, 2^c, biased_low)`，以两条 RVV 指令代替 shift、OR、bias 三条指令。
+模算术保持包括 overflow 在内的相同整数结果；scalar 常量查询不穿过改变位宽的 cast。
+新增普通 binary 继续经过 operation selection 和 leaf finalization；MAC 的精度、布局与
+资源由独立 verifier 核对。不根据 kernel 或存储格式名称匹配。
+
+### `ContractRISCVFloatingPoint`
+
+在资源冻结前将同 block、单 use 的直接浮点 `mul + add` 选择成 `fma` 局部 op。
+两次运算的精度必须相同，不能绕过 cast/widen/narrow、跨 region 或 write/未知 effect。
+当前支持 f32/f64 scalar，以及同布局 RVV vector/vector、vector/scalar；其它
+形状继续使用原有两条运算。选择不依赖 kernel、量化格式或扩展名称。
+独立的 `fma` 保存 typed operands 和 exact leaf，资源 pass 重新核算实际活跃值；
+它沿用原 pointwise 的逐 part 活动长度，没有 closed FMA issue 的调度屏障或 loop-unroll 限制。
+
+### `SelectRISCVScalarPackets`
+
+在资源冻结前，按消费者的物理表示闭合小型 scalar 供应。完整 natural 字段的 unit
+windows 若只有一个同 block 的 RVV→scalar extract 消费者，可在原读取位置改为
+`rvv_regular_repeat_scalar_load`。只接受 2–16 个 i8/i16/i32 元素，且原始 active lanes 小于
+`VLEN × LMUL / SEW` 的实际载体容量；满载的 vector window 保留向量读取，避免仅凭
+静态指令减少就增加 scalar memory issues。逐个 scalar coordinate
+反查原 vector part/lane，并核对所有 window 恰好覆盖同一连续字节范围。多维结果保留
+原 axes、shape 和 scalar part 顺序，不能把转化后的读取延迟到消费者处，也不能增加读取。
+这消除只为标量消费者建立的 vector load、slide 和 extract，原整数计算与后续 reduction 不变。
+
+若原窗口均已填满载体，pass 可以把多个相邻窗口合为一次完整 RVV 读取，继续由显式
+extract 供应 scalar consumers。只有整个逻辑域恰好装满一个合法的至多 m1 carrier 时选择；
+各轴改为 lane 映射，window/part/decode map 同步写回真实 load op。读取字节集合、base、
+alignment 和读取位置保持一致；不会扩大读取、跨写入合并，也不增加 scalar memory issues。
+
+同一 pass 还为连续 K 的 scalar tile load 选择已有 packet 表示：只在完整投影覆盖且
+所有消费者构成一条有序 contraction carry 时冻结 packet，并核对 scalar 驻留上界。
+这些选择都来自 storage、use-def 和坐标关系，不按算子或量化格式选择。
+
+参考 Triton `CoalesceUtils.cpp:17-94` 按访问连续性、shape 和消费分布选择读取宽度；
+Weft 的 CPU 消费者可以持有 scalar replicas，因而这里直接供应这些标量，不引入 SIMT
+线程布局。实际读取与表示选择保存在 Physical IR，terminal 不重新分析消费者。
 
 ### `MaterializeRISCVResources`
 

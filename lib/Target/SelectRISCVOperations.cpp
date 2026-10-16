@@ -4,6 +4,7 @@
 #include "RISCVPhysicalSupport.h"
 
 #include "Weft/Dialect/RISCV/IR/RISCVDialect.h"
+#include "Weft/Dialect/RISCV/IR/Contraction.h"
 #include "Weft/Dialect/RISCV/IR/Fragment.h"
 #include "Weft/Dialect/RISCV/IR/Numerics.h"
 
@@ -310,9 +311,31 @@ void selectZeroSeedProducts(mlir::ModuleOp module,
   }
 }
 
-void selectWidenAdds(mlir::ModuleOp module, mlir::IRRewriter &rewriter) {
+void selectWidenContractSteps(mlir::ModuleOp module, mlir::IRRewriter &rewriter) {
+  module.walk([&](riscv::RVVContractStepOp step) {
+    auto kernel = step->getParentOfType<riscv::KernelOp>();
+    if (!kernel || kernel.getResourcesMaterialized() || !kernel.getTarget().getHasWideningInteger() ||
+        step.getLeaf().getInstruction() != "rvv.vmacc.vx") return;
+    auto lhs = step.getLhs().getDefiningOp<riscv::WidenOp>();
+    auto rhs = step.getRhs().getDefiningOp<riscv::WidenOp>();
+    if (!lhs || !rhs || lhs == rhs || !lhs->hasOneUse() || !rhs->hasOneUse()) return;
+    auto geometry = riscv::ContractStepGeometry::get(lhs.getInput().getType(), rhs.getInput().getType(),
+        step.getResult().getType(), step.getReductionAxis(), step.getLaneOperand(), "rvv.vwmacc.vx");
+    if (!geometry) return;
+    step.getLhsMutable().assign(lhs.getInput());
+    step.getRhsMutable().assign(rhs.getInput());
+    step.setLeafAttr(riscv_internal::leaf(rewriter, "rvv", "contract-step", "rvv.vwmacc.vx", "rvv.vwmacc.vx",
+        0, 0, 0, 0, "none", step.getActive() ? "undisturbed" : "agnostic",
+        {static_cast<int64_t>(step.getReductionAxis())}));
+    rewriter.eraseOp(lhs);
+    rewriter.eraseOp(rhs);
+  });
+}
+
+void selectWidenBinaries(mlir::ModuleOp module, mlir::IRRewriter &rewriter) {
   module.walk([&](riscv::BinaryOp binary) {
-    if (binary.getKind() != "add")
+    const bool multiply = binary.getKind() == "mul";
+    if (binary.getKind() != "add" && !multiply)
       return;
     auto lhs = binary.getLhs().getDefiningOp<riscv::WidenOp>();
     auto rhs = binary.getRhs().getDefiningOp<riscv::WidenOp>();
@@ -324,22 +347,32 @@ void selectWidenAdds(mlir::ModuleOp module, mlir::IRRewriter &rewriter) {
       return;
     auto left = mlir::dyn_cast<riscv::ValueType>(lhs.getInput().getType());
     auto right = mlir::dyn_cast<riscv::ValueType>(rhs.getInput().getType());
-    if (!riscv::supportsRVVWidenAdd(kernel.getTarget(), left, right, result))
+    if (kernel.getResourcesMaterialized() ||
+        !riscv::supportsRVVWidenBinary(kernel.getTarget(), left, right, result))
       return;
     auto element = mlir::cast<mlir::IntegerType>(left.getElementType());
+    if (multiply && (element.getWidth() > 16 ||
+                     result.getLayout().getValidity() != "full"))
+      return;
     const llvm::StringRef instruction =
-        element.isUnsigned() ? "rvv.vwaddu.vv" : "rvv.vwadd.vv";
+        multiply ? (element.isUnsigned() ? "rvv.vwmulu.vv" : "rvv.vwmul.vv")
+                 : (element.isUnsigned() ? "rvv.vwaddu.vv" : "rvv.vwadd.vv");
     rewriter.setInsertionPoint(binary);
-    auto added = rewriter.create<riscv::RVVWidenAddOp>(
-        binary.getLoc(), result, lhs.getInput(), rhs.getInput(),
-        riscv_internal::leaf(
-            rewriter, "rvv", "widen-add", instruction, instruction,
+    auto leaf = riscv_internal::leaf(
+            rewriter, "rvv", multiply ? "widen-multiply" : "widen-add", instruction, instruction,
             left.getLayout().getRegisterGroups() +
                 right.getLayout().getRegisterGroups(),
             result.getLayout().getRegisterGroups(), 0, 0, "none",
-            result.getLayout().getValidity() == "tail" ? "agnostic" : "exact"));
-    riscv_internal::copyOrigin(binary, added);
-    rewriter.replaceOp(binary, added.getResult());
+            result.getLayout().getValidity() == "tail" ? "agnostic" : "exact");
+    mlir::Operation *selected;
+    if (multiply)
+      selected = rewriter.create<riscv::RVVWidenMultiplyOp>(
+          binary.getLoc(), result, lhs.getInput(), rhs.getInput(), leaf);
+    else
+      selected = rewriter.create<riscv::RVVWidenAddOp>(
+          binary.getLoc(), result, lhs.getInput(), rhs.getInput(), leaf);
+    riscv_internal::copyOrigin(binary, selected);
+    rewriter.replaceOp(binary, selected->getResults());
     rewriter.eraseOp(lhs);
     rewriter.eraseOp(rhs);
   });
@@ -450,6 +483,52 @@ void coalescePackedScaleSlices(mlir::ModuleOp module,
   }
 }
 
+void selectContiguousRegisterExtracts(mlir::ModuleOp module, mlir::IRRewriter &rewriter) {
+  llvm::SmallVector<riscv::ExtractOp> extracts;
+  module.walk([&](riscv::ExtractOp op) { extracts.push_back(op); });
+  for (auto op : extracts) {
+    auto kernel = op->getParentOfType<riscv::KernelOp>();
+    auto input = op.getInput().getType();
+    auto result = mlir::dyn_cast<riscv::ValueType>(op.getResult().getType());
+    if (!kernel || kernel.getResourcesMaterialized() || !result ||
+        op.getAccess().getMapping() != "dense" || hasEncodedFieldOrigin(op.getInput()) ||
+        input.getShape().size() != 1 || result.getShape().size() != 1 ||
+        input.getAxisIds() != result.getAxisIds() ||
+        input.getElementType() != result.getElementType() ||
+        op.getSelectors().size() != 1 || op.getIndices().size() != 1 ||
+        mlir::cast<mlir::StringAttr>(op.getSelectors()[0]).getValue() != "gather")
+      continue;
+    auto a = input.getLayout(), b = result.getLayout();
+    if (a.getCarrier() != "rvv" || b.getCarrier() != "rvv" ||
+        a.getValidity() != "full" || b.getValidity() != "full" ||
+        a.getReplicaGroup() != 1 || b.getReplicaGroup() != 1 ||
+        a.getReplicaFactors()[0] != 1 || b.getReplicaFactors()[0] != 1 ||
+        a.getFragmentFactors()[0] != 1 || b.getFragmentFactors()[0] != 1 ||
+        a.getLocalFactors()[0] != 1 || b.getLocalFactors()[0] != 1 ||
+        b.getTimeFactors()[0] != 1 || result.getShape()[0] != b.getLaneFactors()[0] ||
+        result.getShape()[0] <= 0 || input.getShape()[0] < result.getShape()[0] ||
+        a.getLaneFactors()[0] % result.getShape()[0] ||
+        (a.getTimeFactors()[0] != 1 && a.getLaneFactors()[0] != result.getShape()[0]) ||
+        a.getLmulEighths() < b.getLmulEighths() ||
+        a.getLmulEighths() % b.getLmulEighths())
+      continue;
+    auto base = riscv_internal::constantContiguousIndexBase(op.getIndices()[0]);
+    if (!base || *base > input.getShape()[0] - result.getShape()[0] ||
+        *base % result.getShape()[0])
+      continue;
+    rewriter.setInsertionPoint(op);
+    auto slice = rewriter.create<riscv::RVVIssueSliceOp>(
+        op.getLoc(), result, op.getInput(),
+        rewriter.getDenseI64ArrayAttr({*base / a.getLaneFactors()[0]}),
+        rewriter.getDenseI64ArrayAttr({*base % a.getLaneFactors()[0]}),
+        riscv_internal::leaf(rewriter, "transfer", "issue-slice", "rvv.issue-slice", "rvv.issue-slice",
+            a.getRegisterGroups(), b.getRegisterGroups(),
+            (a.getLmulEighths() + 7) / 8, 0, "none", "exact"));
+    riscv_internal::copyOrigin(op, slice);
+    rewriter.replaceOp(op, slice.getResult());
+  }
+}
+
 void selectRegisterSlices(mlir::ModuleOp module, mlir::Builder &builder) {
   module.walk([&](riscv::RVVIssueSliceOp slice) {
     auto kernel = slice->getParentOfType<riscv::KernelOp>();
@@ -479,8 +558,10 @@ public:
     mlir::IRRewriter rewriter(&getContext());
     selectLoopCarriedWidenProducts(getOperation(), rewriter);
     selectZeroSeedProducts(getOperation(), rewriter);
-    selectWidenAdds(getOperation(), rewriter);
+    selectWidenContractSteps(getOperation(), rewriter);
+    selectWidenBinaries(getOperation(), rewriter);
     coalescePackedScaleSlices(getOperation(), rewriter);
+    selectContiguousRegisterExtracts(getOperation(), rewriter);
     selectRegisterSlices(getOperation(), rewriter);
     mlir::Builder builder(&getContext());
     bool failed = false;
@@ -701,7 +782,8 @@ private:
           riscv_internal::logicalElement(result));
       auto target = operation->getParentOfType<riscv::KernelOp>().getTarget();
       auto wideningDotFitsRegisterMicrotile = [&]() {
-        if (!mlir::isa<riscv::OuterContractOp>(operation))
+        if (!mlir::isa<riscv::OuterContractOp>(operation) &&
+            (riscv_internal::logicalAxes(result).empty() || over.size() != 1))
           return true;
         auto value = mlir::dyn_cast<riscv::ValueType>(result);
         if (!value)

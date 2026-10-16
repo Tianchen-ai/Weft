@@ -251,16 +251,24 @@ bool checkedScale(int64_t value, int64_t factor, int64_t &result) {
 }
 
 std::optional<int64_t> constantInteger(mlir::Value value) {
+  auto read = [](mlir::IntegerAttr integer) -> std::optional<int64_t> {
+    if (!integer) return std::nullopt;
+    auto type = mlir::dyn_cast<mlir::IntegerType>(integer.getType());
+    const auto &bits = integer.getValue();
+    if (type && type.isUnsigned())
+      return bits.isIntN(63) ? std::optional<int64_t>(bits.getZExtValue()) : std::nullopt;
+    return bits.isSignedIntN(64) ? std::optional<int64_t>(bits.getSExtValue()) : std::nullopt;
+  };
   auto constant = value.getDefiningOp<riscv::ConstantOp>();
   if (constant) {
     auto integer = mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue());
-    return integer ? std::optional<int64_t>(integer.getInt()) : std::nullopt;
+    return read(integer);
   }
   auto arithmetic = value.getDefiningOp<mlir::arith::ConstantOp>();
   if (!arithmetic)
     return std::nullopt;
   auto integer = mlir::dyn_cast<mlir::IntegerAttr>(arithmetic.getValue());
-  return integer ? std::optional<int64_t>(integer.getInt()) : std::nullopt;
+  return read(integer);
 }
 
 std::optional<int64_t> exactNonnegativeConstantImpl(mlir::Value value,
@@ -2973,6 +2981,49 @@ mlir::LogicalResult materializeLocalEntrySources(mlir::ModuleOp module,
   return mlir::failure(failed);
 }
 
+mlir::FailureOr<riscv::ValueType> denseMemoryCarrier(
+    mlir::Operation *operation, riscv::ValueType type, mlir::Builder &builder) {
+  if (!type || type.getLayout().getCarrier() != "rvv") return type;
+  auto before = type.getLayout();
+  auto lanes = before.getLaneFactors().asArrayRef();
+  if (llvm::count_if(lanes, [](int64_t n) { return n > 1; }) <= 1) return type;
+  auto kernel = operation->getParentOfType<riscv::KernelOp>();
+  if (!kernel || kernel.getResourcesMaterialized() || before.getValidity() != "full" ||
+      before.getReplicaGroup() != 1)
+    return operation->emitError("dense multi-axis lane access requires an unfrozen full register layout"), mlir::failure();
+  llvm::SmallVector<int64_t> splitLanes(lanes);
+  llvm::SmallVector<int64_t> replicas(before.getReplicaFactors().asArrayRef());
+  int64_t inner = lanes.size() - 1;
+  while (lanes[inner] == 1) --inner;
+  int64_t factor = 1;
+  for (int64_t axis = 0; axis < inner; ++axis) {
+    auto next = riscv_internal::staticProduct({factor, lanes[axis]});
+    auto copies = riscv_internal::staticProduct({replicas[axis], lanes[axis]});
+    if (!next || !copies)
+      return operation->emitError("dense lane split exceeds the coordinate domain"), mlir::failure();
+    factor = *next;
+    replicas[axis] = *copies;
+    splitLanes[axis] = 1;
+  }
+  if (before.getLmulEighths() % factor)
+    return operation->emitError("dense lane split has no exact register carrier"), mlir::failure();
+  const int64_t lmul = before.getLmulEighths() / factor;
+  auto copies = riscv_internal::staticProduct(replicas);
+  auto groups = copies ? riscv_internal::staticProduct({*copies, std::max<int64_t>(1, (lmul + 7) / 8)})
+                       : std::optional<int64_t>();
+  if (!groups)
+    return operation->emitError("dense lane split has unbounded register residency"), mlir::failure();
+  auto layout = riscv::LayoutAttr::get(builder.getContext(), "rvv", type.getAxisIds(),
+      before.getTimeFactors(), riscv_internal::integers(builder, splitLanes),
+      riscv_internal::integers(builder, replicas), before.getFragmentFactors(),
+      before.getLocalFactors(), before.getSew(), lmul, before.getVl() / factor, *groups, "full");
+  auto result = mlir::cast<riscv::ValueType>(riscv_internal::withLayout(type, layout));
+  if (!riscv::supportsRVVLayout(kernel.getTarget(), layout) ||
+      !riscv::rvvLayoutRepackSlices(type, result))
+    return operation->emitError("dense memory requires a legal one-axis carrier conversion"), mlir::failure();
+  return result;
+}
+
 class PlanRISCVMemoryPass
     : public mlir::PassWrapper<PlanRISCVMemoryPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -3029,6 +3080,21 @@ public:
         return;
       auto memory = operation.getRegion().getType();
       auto encoding = mlir::cast<kernel::EncodingType>(memory.getEncoding());
+      auto original = mlir::dyn_cast<riscv::ValueType>(operation.getResult().getType());
+      if (encoding.getKind() == "dense" && original) {
+        auto carrier = denseMemoryCarrier(operation, original, builder);
+        if (mlir::failed(carrier)) { failed = true; return; }
+        if (*carrier != original) {
+          operation.getResult().setType(*carrier);
+          rewriter.setInsertionPointAfter(operation);
+          auto conversion = rewriter.create<riscv::ConvertLayoutOp>(operation.getLoc(), original,
+              operation.getResult(), riscv_internal::conversion(builder, "lane_repack", "pure",
+                  riscv::rvvLayoutRepackTemporaryGroups(operation->getParentOfType<riscv::KernelOp>().getTarget(), *carrier, original)),
+              riscv::AccessAttr(), riscv_internal::unselectedLeaf(builder));
+          riscv_internal::copyOrigin(operation, conversion);
+          operation.getResult().replaceAllUsesExcept(conversion.getResult(), conversion);
+        }
+      }
       llvm::StringRef mapping = encoding.getKind() == "dense" ? "dense" : "opaque";
       auto access = encoding.getKind() == "dense"
                         ? riscv_internal::denseAccess(
@@ -3055,6 +3121,22 @@ public:
         if (mlir::failed(riscv_internal::planFieldStore(rewriter, operation)))
           failed = true;
         return;
+      }
+      auto original = mlir::dyn_cast<riscv::ValueType>(operation.getValue().getType());
+      auto memoryType = mlir::dyn_cast<riscv::MemDescType>(operation.getRegion().getType());
+      if (original && memoryType &&
+          mlir::cast<kernel::EncodingType>(memoryType.getEncoding()).getKind() == "dense") {
+        auto carrier = denseMemoryCarrier(operation, original, builder);
+        if (mlir::failed(carrier)) { failed = true; return; }
+        if (*carrier != original) {
+          rewriter.setInsertionPoint(operation);
+          auto conversion = rewriter.create<riscv::ConvertLayoutOp>(operation.getLoc(), *carrier,
+              operation.getValue(), riscv_internal::conversion(builder, "lane_repack", "pure",
+                  riscv::rvvLayoutRepackTemporaryGroups(operation->getParentOfType<riscv::KernelOp>().getTarget(), original, *carrier)),
+              riscv::AccessAttr(), riscv_internal::unselectedLeaf(builder));
+          riscv_internal::copyOrigin(operation, conversion);
+          operation.getValueMutable().assign(conversion.getResult());
+        }
       }
       auto memory = operation.getRegion().getType();
       auto encoding = mlir::cast<kernel::EncodingType>(memory.getEncoding());
@@ -3160,6 +3242,21 @@ public:
           0, 0, *temporary, 0, "none", "exact"));
     });
     getOperation().walk([&](riscv::ExtractOp operation) {
+      auto regular = operation->getAttrOfType<mlir::DenseI64ArrayAttr>("index_pattern");
+      if (regular && operation.getAccess().getForm() == "register") {
+        auto result = mlir::dyn_cast<riscv::ValueType>(operation.getResult().getType());
+        auto indices = riscv::rvvRegularGatherIndices(operation.getInput().getType(), result,
+                                                      regular.asArrayRef());
+        if (!indices) {
+          operation.emitError("regular register gather lost its uniform carrier mapping");
+          failed = true;
+          return;
+        }
+        operation.setLeafAttr(riscv_internal::leaf(builder, "rvv", "extract",
+            "rvv.extract.regular-scalar", "rvv.extract.regular-scalar", 0, 0,
+            0, 0, "none", "exact", *indices));
+        return;
+      }
       if (auto parts = riscv::scalarExtractParts(operation)) {
         operation.setAccessAttr(makeAccess(builder, "register", "natural", 1));
         operation.setLeafAttr(riscv_internal::leaf(builder, "scalar", "extract",
@@ -3257,6 +3354,24 @@ public:
       }
       if (gather && compatibleRegisterGather) {
         operation.setAccessAttr(makeAccess(builder, "register", "natural", 1));
+        auto relation = riscv_internal::analyzeRegularIndexRelation(gatherIndex);
+        if (relation && operation.getSelectors().size() == 1 &&
+            operation.getIndices().size() == 1 &&
+            (!relation->dynamicBase ||
+             relation->dynamicBase.getType() == riscv_internal::logicalElement(gatherIndex.getType()))) {
+          const int64_t pattern[] = {relation->base, relation->stride, relation->repeat};
+          auto indices = riscv::rvvRegularGatherIndices(inputValue, resultValue, pattern);
+          if (indices) {
+            operation.getIndicesMutable().assign(relation->dynamicBase
+                ? mlir::ValueRange{relation->dynamicBase} : mlir::ValueRange{});
+            operation.setSelectorsAttr(builder.getArrayAttr({builder.getStringAttr("regular")}));
+            operation->setAttr("index_pattern", builder.getDenseI64ArrayAttr(pattern));
+            operation.setLeafAttr(riscv_internal::leaf(builder, "rvv", "extract",
+                "rvv.extract.regular-scalar", "rvv.extract.regular-scalar", 0, 0,
+                0, 0, "none", "exact", *indices));
+            return;
+          }
+        }
         operation.setLeafAttr(riscv_internal::leaf(
             builder, "rvv", "extract", "rvv.extract.vrgather",
             "rvv.extract.vrgather", 0, 0));
@@ -3975,6 +4090,38 @@ public:
           }
       if (!preservesFreeAxes)
         continue;
+      // A joined metadata window must fit its gather carrier. When one full
+      // logical axis spans several fractional carriers, use the smallest
+      // wider carrier for that same window, then explicitly restore the
+      // consumer's representation below. No extra field elements are read.
+      auto layout = candidate.resultType.getLayout();
+      if (fieldMapping == "joined" && pattern->repeat == 1 &&
+          candidate.resultType.getShape().size() == 1 &&
+          layout.getCarrier() == "rvv" && layout.getValidity() == "full" &&
+          layout.getSew() == 8 && layout.getReplicaGroup() == 1 &&
+          layout.getTimeFactors()[0] > 1 && layout.getReplicaFactors()[0] == 1 &&
+          layout.getFragmentFactors()[0] == 1 && layout.getLocalFactors()[0] == 1 &&
+          layout.getLaneFactors()[0] > 1 && candidate.resultType.getShape()[0] > 0 &&
+          candidate.resultType.getShape()[0] % layout.getLaneFactors()[0] == 0 &&
+          candidate.resultType.getShape()[0] / layout.getLaneFactors()[0] ==
+              layout.getTimeFactors()[0]) {
+        const int64_t extent = candidate.resultType.getShape()[0];
+        auto target = extract->getParentOfType<riscv::KernelOp>().getTarget();
+        for (int64_t lmul = layout.getLmulEighths(); lmul > 0 && lmul <= 8; lmul *= 2) {
+          auto widened = riscv::LayoutAttr::get(
+              rewriter.getContext(), "rvv", candidate.resultType.getAxisIds(),
+              rewriter.getDenseI64ArrayAttr({1}), rewriter.getDenseI64ArrayAttr({extent}),
+              rewriter.getDenseI64ArrayAttr({1}), rewriter.getDenseI64ArrayAttr({1}),
+              rewriter.getDenseI64ArrayAttr({1}), layout.getSew(), lmul, extent,
+              (lmul + 7) / 8, "full");
+          if (!riscv::supportsRVVLayout(target, widened))
+            continue;
+          candidate.resultType = riscv::ValueType::get(
+              rewriter.getContext(), candidate.resultType.getElementType(),
+              candidate.resultType.getShape(), candidate.resultType.getAxisIds(), widened);
+          break;
+        }
+      }
       candidate.lanes =
           candidate.resultType.getLayout().getLaneFactors()[gatherDimension];
       candidate.reductionAxis = candidate.resultType.getAxisIds()[gatherDimension];
@@ -4006,7 +4153,10 @@ public:
       }
       if (!bounded)
         continue;
-      if (!alreadyRegular && preservesSourceAxes && fieldMapping == "natural") {
+      // index_pattern is a static mapping. A dynamic base must remain an SSA
+      // operand of the indexed/regular-repeat read, including after unrolling.
+      if (!alreadyRegular && !candidate.dynamicBase && preservesSourceAxes &&
+          fieldMapping == "natural") {
         rewriter.setInsertionPoint(extract);
         auto replacement = rewriter.create<riscv::ExtractOp>(
             extract.getLoc(), selectedResultType, candidate.field.getResult(),
@@ -4221,6 +4371,16 @@ public:
 
       for (auto [index, candidate] : llvm::enumerate(group)) {
         mlir::Value replacement = gather.getResults()[index];
+        auto original = mlir::cast<riscv::ValueType>(candidate->extract.getResult().getType());
+        if (!candidate->resultConversion && replacement.getType() != original) {
+          auto restored = rewriter.create<riscv::ConvertLayoutOp>(
+              candidate->extract.getLoc(), original, replacement,
+              riscv_internal::layoutConversion(rewriter, candidate->resultType.getLayout(),
+                                               original.getLayout()),
+              riscv::AccessAttr(), riscv_internal::unselectedLeaf(rewriter));
+          riscv_internal::copyOrigin(candidate->extract, restored);
+          replacement = restored.getResult();
+        }
         if (candidate->resultConversion) {
           candidate->resultConversion.getResult().replaceAllUsesWith(replacement);
           rewriter.eraseOp(candidate->resultConversion);

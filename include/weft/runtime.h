@@ -139,6 +139,9 @@ WEFT_API weft_status weft_kernel_describe(const weft_kernel *kernel,
 WEFT_API weft_status weft_kernel_argument(const weft_kernel *kernel, size_t index,
                                          weft_argument_info *result, weft_error *error);
 WEFT_API weft_status weft_kernel_check_thread(const weft_kernel *kernel, weft_error *error);
+/* Explicitly narrow the caller's current affinity to the artifact's capable
+   CPUs. Never expands affinity; fails if the intersection is empty. */
+WEFT_API weft_status weft_kernel_bind_thread(const weft_kernel *kernel, weft_error *error);
 /* For a consumer that checked the exact typed ABI and owns a bounded worker
    execution scope. The handle must outlive every direct call. Check the worker
    before each scope, and do not change affinity/vector state within that scope. */
@@ -247,6 +250,8 @@ WEFT_API weft_status weft_package_kernel(weft_package *package, const char *name
                                         weft_kernel **result, weft_error *error);
 /* Framework bindings map role names to explicit package entries. They do not
    select or alter a compiled program. Returned strings have package lifetime. */
+WEFT_API weft_status weft_package_has_binding_group(const weft_package *package, const char *group,
+                                                   bool *present, weft_error *error);
 WEFT_API weft_status weft_package_binding_count(const weft_package *package, const char *group,
                                                size_t *count, weft_error *error);
 WEFT_API weft_status weft_package_binding(const weft_package *package, const char *group, size_t index,

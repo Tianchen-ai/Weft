@@ -197,6 +197,8 @@ analyzeRegularIndexRelationImpl(mlir::Value value, unsigned depth) {
     auto scale = [&](riscv_internal::RegularIndexRelation pattern,
                      int64_t factor)
         -> std::optional<riscv_internal::RegularIndexRelation> {
+      if (pattern.dynamicBase && factor != 1)
+        return std::nullopt;
       if (!checkedRegularScale(pattern.base, factor, pattern.base) ||
           !checkedRegularScale(pattern.stride, factor, pattern.stride))
         return std::nullopt;
@@ -207,7 +209,8 @@ analyzeRegularIndexRelationImpl(mlir::Value value, unsigned depth) {
     if (rhs && lhsConstant)
       return scale(*rhs, *lhsConstant);
   }
-  if (binary.getKind() == "div" && lhs && rhsConstant && *rhsConstant > 0 &&
+  if (binary.getKind() == "div" && lhs && !lhs->dynamicBase &&
+      rhsConstant && *rhsConstant > 0 &&
       lhs->base % *rhsConstant == 0 && lhs->stride == 1 &&
       lhs->repeat <= std::numeric_limits<int64_t>::max() / *rhsConstant) {
     lhs->base /= *rhsConstant;
@@ -393,7 +396,7 @@ riscv_internal::planWidenDotLaneSlices(
     const size_t position = static_cast<size_t>(
         found - operand.getAxisIds().asArrayRef().begin());
     const int64_t extent = layout.getTimeFactors()[position];
-    if (extent <= 0)
+    if (extent <= 0 || layout.getReplicaFactors()[position] != 1)
       return std::nullopt;
     reductionTimeExtents.push_back(extent);
   }
@@ -799,9 +802,13 @@ bool riscv_internal::selectLaneRepack(mlir::Builder &builder, riscv::ConvertLayo
   auto kernel = operation->getParentOfType<riscv::KernelOp>();
   auto conversion = operation.getConversion();
   if (!kernel || kernel.getResourcesMaterialized() || conversion.getEffect() != "pure" ||
-      (conversion.getKind() != "register_to_lane" && conversion.getKind() != "time_to_lane") ||
+      (conversion.getKind() != "register_to_lane" && conversion.getKind() != "time_to_lane" &&
+       conversion.getKind() != "tuple") ||
       riscv::fieldReadProjection(operation.getInput())) return false;
   auto source = operation.getInput().getType(), target = operation.getResult().getType();
+  if (conversion.getKind() == "tuple" &&
+      source.getLayout().getReplicaFactors() == target.getLayout().getReplicaFactors())
+    return false;
   bool laneMovesOut = false;
   if (source.getAxisIds() == target.getAxisIds())
     for (auto [before, after] : llvm::zip(source.getLayout().getLaneFactors().asArrayRef(),
@@ -811,7 +818,7 @@ bool riscv_internal::selectLaneRepack(mlir::Builder &builder, riscv::ConvertLayo
   // Exchanging lane and replica axes preserves ordered coordinates; concatenating
   // the old vector parts does not. Numeric field reads use this same relation.
   operation.setConversionAttr(riscv_internal::conversion(builder, "lane_repack", "pure",
-      riscv::rvvLayoutRepackTemporaryGroups(source, target)));
+      riscv::rvvLayoutRepackTemporaryGroups(operation->getParentOfType<riscv::KernelOp>().getTarget(), source, target)));
   operation.setLeafAttr(unselectedLeaf(builder));
   return true;
 }
@@ -1284,6 +1291,44 @@ riscv_internal::booleanComparisonTemporaryGroups(riscv::CompareOp operation) {
   return 1 + (scalar ? (result.getLayout().getLmulEighths() + 7) / 8 : 0);
 }
 
+std::optional<int64_t> riscv_internal::constantContiguousIndexBase(mlir::Value value, unsigned depth) {
+  if (depth > 8) return std::nullopt;
+  auto type = mlir::dyn_cast<riscv::ValueType>(value.getType());
+  auto integer = type ? mlir::dyn_cast<mlir::IntegerType>(type.getElementType()) : mlir::IntegerType();
+  if (!integer || !integer.isUnsigned() || integer.getWidth() > 64 ||
+      type.getShape().size() != 1 || type.getShape()[0] <= 0)
+    return std::nullopt;
+  const uint64_t maximum = integer.getWidth() == 64 ? UINT64_MAX
+      : (uint64_t{1} << integer.getWidth()) - 1;
+  if (auto iota = value.getDefiningOp<riscv::IotaOp>()) {
+    if (iota.getStart() < 0 || iota.getEnd() <= iota.getStart() ||
+        static_cast<uint64_t>(iota.getEnd() - 1) > maximum)
+      return std::nullopt;
+    return iota.getStart();
+  }
+  if (auto conversion = value.getDefiningOp<riscv::ConvertLayoutOp>();
+      conversion && conversion.getConversion().getEffect() == "pure" &&
+      conversion.getInput().getType().getElementType() == type.getElementType() &&
+      conversion.getInput().getType().getShape() == type.getShape() &&
+      conversion.getInput().getType().getAxisIds() == type.getAxisIds())
+    return constantContiguousIndexBase(conversion.getInput(), depth + 1);
+  auto add = value.getDefiningOp<riscv::BinaryOp>();
+  if (!add || add.getKind() != "add") return std::nullopt;
+  for (unsigned side = 0; side < 2; ++side) {
+    auto constant = add->getOperand(side).getDefiningOp<riscv::ConstantOp>();
+    auto attr = constant ? mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue()) : mlir::IntegerAttr();
+    auto base = constantContiguousIndexBase(add->getOperand(1 - side), depth + 1);
+    if (!attr || !base || attr.getValue().getActiveBits() > 63) continue;
+    uint64_t offset = attr.getValue().getZExtValue();
+    if (static_cast<uint64_t>(type.getShape()[0] - 1) > maximum ||
+        offset > INT64_MAX - *base ||
+        static_cast<uint64_t>(*base) + offset > maximum - (type.getShape()[0] - 1))
+      continue;
+    return *base + offset;
+  }
+  return std::nullopt;
+}
+
 bool riscv_internal::isSameWidthIntegerCast(mlir::Operation *operation) {
   if (!mlir::isa<riscv::CastOp, riscv::NarrowOp, riscv::WidenOp>(operation))
     return false;
@@ -1483,6 +1528,8 @@ riscv_internal::terminalInstruction(mlir::Operation *operation) {
       return "rvv.fnarrow.f32-f16";
     if (source.isInteger(32) && target.isF32())
       return "rvv.convert.i32-f32";
+    if (source.isInteger(16) && target.isF32())
+      return "rvv.convert.i16-f32";
     if (sourceInteger && targetInteger &&
         targetInteger.getWidth() >
             std::max<unsigned>(8, sourceInteger.getWidth()) &&
@@ -1548,6 +1595,12 @@ riscv_internal::terminalInstruction(mlir::Operation *operation) {
                  : std::string();
     }
     if (carrier != "rvv")
+      return {};
+    if (!registerAxis && llvm::any_of(
+            llvm::enumerate(input.getLayout().getLaneFactors().asArrayRef()),
+            [&](auto factor) {
+              return factor.index() != static_cast<size_t>(reduce.getAxis()) && factor.value() > 1;
+            }))
       return {};
     return std::string(registerAxis ? "rvv.register-reduce."
                                     : "rvv.lane-reduce.") +
@@ -1715,28 +1768,51 @@ riscv_internal::fieldFacts(riscv::FieldOp operation) {
 }
 
 std::optional<int64_t> riscv_internal::constantInt(mlir::Value value) {
-  while (true) {
-    if (auto cast = value.getDefiningOp<riscv::CastOp>()) {
-      value = cast.getInput();
-      continue;
+  struct IntegerConstant { llvm::APInt bits; bool isUnsigned; };
+  std::function<std::optional<IntegerConstant>(mlir::Value, unsigned)> evaluate =
+      [&](mlir::Value current, unsigned depth) -> std::optional<IntegerConstant> {
+    if (depth > 24) return std::nullopt;
+    auto element = logicalElement(current.getType());
+    auto type = mlir::dyn_cast<mlir::IntegerType>(element);
+    if (!type && !element.isIndex()) return std::nullopt;
+    const bool isUnsigned = type && type.isUnsigned();
+    unsigned width = type ? type.getWidth() : 0;
+    if (element.isIndex()) {
+      auto scope = current.getParentRegion()->getParentOp();
+      auto kernel = mlir::dyn_cast<riscv::KernelOp>(scope);
+      if (!kernel) kernel = scope->getParentOfType<riscv::KernelOp>();
+      if (!kernel) return std::nullopt;
+      auto march = kernel.getTarget().getMarch();
+      if (march.starts_with("rv32")) width = 32;
+      else if (march.starts_with("rv64")) width = 64;
+      else return std::nullopt;
     }
-    if (auto cast = value.getDefiningOp<mlir::arith::IndexCastOp>()) {
-      value = cast.getIn();
-      continue;
+    mlir::IntegerAttr integer;
+    if (auto constant = current.getDefiningOp<riscv::ConstantOp>())
+      integer = mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue());
+    else if (auto constant = current.getDefiningOp<mlir::arith::ConstantOp>())
+      integer = mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue());
+    if (integer) return IntegerConstant{isUnsigned ? integer.getValue().zextOrTrunc(width)
+                                                 : integer.getValue().sextOrTrunc(width), isUnsigned};
+    mlir::Value input;
+    std::optional<bool> extension;
+    if (auto cast = current.getDefiningOp<riscv::CastOp>()) input = cast.getInput();
+    else if (auto cast = current.getDefiningOp<mlir::arith::IndexCastOp>()) {
+      input = cast.getIn(); extension = false;
+    } else if (auto cast = current.getDefiningOp<mlir::arith::IndexCastUIOp>()) {
+      input = cast.getIn(); extension = true;
     }
-    if (auto cast = value.getDefiningOp<mlir::arith::IndexCastUIOp>()) {
-      value = cast.getIn();
-      continue;
-    }
-    break;
-  }
-  if (auto constant = value.getDefiningOp<riscv::ConstantOp>())
-    if (auto integer = mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue()))
-      return integer.getInt();
-  if (auto constant = value.getDefiningOp<mlir::arith::ConstantOp>())
-    if (auto integer = mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue()))
-      return integer.getInt();
-  return std::nullopt;
+    if (!input) return std::nullopt;
+    auto source = evaluate(input, depth + 1);
+    if (!source) return std::nullopt;
+    return IntegerConstant{extension.value_or(source->isUnsigned)
+        ? source->bits.zextOrTrunc(width) : source->bits.sextOrTrunc(width), isUnsigned};
+  };
+  auto constant = evaluate(value, 0);
+  if (!constant) return std::nullopt;
+  if (constant->isUnsigned)
+    return constant->bits.isIntN(63) ? std::optional<int64_t>(constant->bits.getZExtValue()) : std::nullopt;
+  return constant->bits.isSignedIntN(64) ? std::optional<int64_t>(constant->bits.getSExtValue()) : std::nullopt;
 }
 
 mlir::Value riscv_internal::stripRepresentationConversions(

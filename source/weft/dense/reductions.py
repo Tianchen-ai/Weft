@@ -26,6 +26,15 @@ def product_sum(X: wl.View[wl.f32, (N,)], Weight: wl.View[wl.f32, (N,)],
     wl.store(Y[0], total)
 
 
+@weft.kernel(alias_groups={"X": "input", "Weight": "input", "Y": "output"})
+def dot_f16(X: wl.View[wl.f16, (N,)], Weight: wl.View[wl.f16, (N,)],
+            Y: wl.View[wl.f32, (1,)]):
+    total = wl.f32(0.0)
+    with wl.level.blocks(N, extent=wl.auto("BLOCK")) as part:
+        total += wl.reduce_dot(wl.f32(wl.load(X[part])), wl.f32(wl.load(Weight[part])), over="n")
+    wl.store(Y[0], total)
+
+
 @weft.kernel(strided=("X", "Weight", "Y"),
              alias_groups={"X": "input", "Weight": "input", "Y": "output"})
 def mixed_dot_f16(X: wl.View[wl.f32, (N,)], Weight: wl.View[wl.f16, (N,)],

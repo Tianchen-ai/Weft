@@ -190,6 +190,7 @@ static bool run_case(Reference &reference, Backend &backend, ggml_type type, int
   }
 #ifdef WEFT_GGML_OBSERVE
   ggml_weft_counters before{}, after{};
+  const auto imeBefore = ggml_weft_ime1_calls();
   require(ggml_weft_counters_get(type, &before), "counter query failed");
 #endif
   auto actual = graph.run(backend, false);
@@ -199,9 +200,11 @@ static bool run_case(Reference &reference, Backend &backend, ggml_type type, int
   const auto dots = after.dot_products - before.dot_products;
   const auto quantized = after.quantized_elements - before.quantized_elements;
   const auto packed = after.extra_buffer_nodes - before.extra_buffer_nodes;
+  const auto imeCalls = ggml_weft_ime1_calls() - imeBefore;
+  const auto weftQuantizes = after.weft_quantize_calls - before.weft_quantize_calls;
   require(after.nodes - before.nodes == 2, "matrix node count does not match graph executions");
   if (extra) {
-    require(packed == 2 && dots == 0 && quantized == 0, "normal packed path was intercepted or misreported");
+    require(packed == 2 && dots == 0 && quantized == 0, "packed and generic paths were mixed");
   } else {
     const bool registered = ggml_weft_registered(type);
     require(dots == (registered ? uint64_t(2 * Graph::rows * tokens * (indirect ? Graph::selected : 1)) : 0),
@@ -235,6 +238,8 @@ static bool run_case(Reference &reference, Backend &backend, ggml_type type, int
 #ifdef WEFT_GGML_OBSERVE
   std::printf(" dots=%llu quantized=%llu packed_nodes=%llu", (unsigned long long)dots,
               (unsigned long long)quantized, (unsigned long long)packed);
+  std::printf(" weft_quantizes=%llu ime_tiles=%llu", (unsigned long long)weftQuantizes,
+              (unsigned long long)imeCalls);
 #endif
   std::puts(reference.record.is_open() ? " normal-path recorded" : " passed");
   return true;
@@ -245,7 +250,8 @@ int main(int argc, char **argv) {
     Reference reference(argc, argv);
     for (int threads : {1, 4}) {
       Backend backend(threads);
-      for (auto type : {GGML_TYPE_Q4_0, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+      for (auto type : {GGML_TYPE_Q4_0, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0,
+                        GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
         run_case(reference, backend, type, threads, 1, false, false);
         run_case(reference, backend, type, threads, 9, false, true);
         run_case(reference, backend, type, threads, 7, true, false);

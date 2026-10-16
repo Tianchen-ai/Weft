@@ -107,6 +107,15 @@ context 的 CPU 集合是发现时的可用范围。每次通用 call 核对当�
 的扩展；sequence 在第一项写入前核对所有入口。独立存储可以并发调用同一 kernel，共享可变
 存储由 host 同步。应用不得在执行期间改变 affinity 或 RVV 控制状态。
 
+加载 artifact 或取得 entry pointer 不执行 kernel。加载时核对该 context 中至少存在一个同时
+满足所有扩展的 CPU；调用时再要求实际线程 affinity 全部属于可执行集合。因而主线程可以
+加载异构核心上的扩展程序，交给具备该能力的 worker 执行，不必改变整个应用的亲和性。
+
+需要执行线程选择时，`kernel.bind_thread()` 显式将当前线程的亲和性收窄到原集合与 artifact
+全部扩展可执行集合的交集；空交集报错，不扩大调用者的 CPU 权限。该绑定在返回后保留，
+调用方拥有其生命周期。`check_thread()` 仍只检查，不改变亲和性。IME adapter 在实际 worker
+的节点函数选择处使用此接口，与平台首次原生 IME 指令触发的核心绑定一致。
+
 性能敏感的框架可在逐项核对 typed ABI 后使用 `weft_kernel_get_entry`。每个有界 worker 工作段
 之前调用 `weft_kernel_check_thread`，段内不能改变执行能力，kernel handle 必须覆盖全部直接调用。
 这个接口不替调用者检查每次裸指针的容量；相应类型、布局与容量证明由 adapter 承担。
@@ -126,7 +135,8 @@ cmake --build /path/to/build --target llama
 ```
 
 运行前设置 `WEFT_GGML_PACKAGE=/path/to/native/package`。启用的集成必须能加载该包，且包内有
-非空 `ggml.vec_dot` bindings；缺失、ABI 不符或目标不匹配明确终止初始化。`GGML_WEFT=OFF`
+至少一个受支持的非空 binding group；缺失、ABI 不符或目标不匹配明确终止初始化。包可用
+`has_binding_group(name)` 查询角色组是否存在，具名 `bindings(name)` 仍对不存在的组报错。`GGML_WEFT=OFF`
 移除 adapter 依赖并保留原 GGML 调用表达式。
 
 接入工具同时修正所支持上游的 vendor build 声明：其 IME 源码要求 C++20，且每个 IME
@@ -143,16 +153,41 @@ bytes、activation Encoding、参数顺序、对齐和 `nrows`。受支持的合
 量化和 barrier，再调用所选 vec-dot；adapter 不重新量化，不改变输出 stride、广播、路由、chunk
 划分或线程池。未注册类型继续使用 GGML 原入口，框架显式 reference 模式使用原入口。
 
+`ggml.from_float` 可绑定 `q8_0` 或 `q8_K` activation quantizer，两个 View 为 `X[K]`、`Y[K]`，
+参数顺序固定，输出 Encoding 与正常 GGML record 完全一致。调用方负责相同舍入环境；接入在
+原量化调用点使用原 workspace，每个 row/chunk 只量化一次。未绑定的量化类型保留上游函数。
+
 更早的 CPU extra-buffer/repack/厂商 IME 路径仍由上游选择；集成不关闭其 build options。
 上游设备可能公开 extra buffer type，但不支持某个 type/shape/VLEN，使用者必须遵守其
 `ggml_backend_dev_supports_op` 判定。whole-matrix Weft 程序如果拥有 activation quantization
-或不同的 persistent weight layout，不能注册成 vec-dot。它需要一个与布局和准备责任相匹配
-的独立接入合同；此接口不声称已替换这种路径。
+或不同的 persistent weight layout，不能注册成 vec-dot。
+
+`ggml.ime1` 的 `q4_centered_prefill` / `q4_affine_prefill` 与
+`q4_centered_decode` / `q4_affine_decode` 是独立的 packed row-tile 合同。
+三个 View 为 `W[N,K]`、`Xq[M,K]`、带显式行列 stride 的 `Y[M,N]`；维度顺序为 `N,K,M`。
+权重分别使用 `IMEQ4Centered_I[16]` / `IMEQ4Affine_I[16]`；prefill 的激活使用
+`IMEQ8_I[4]`，decode 使用 `IMEQ8_I[1]`。adapter 在上游选择 IME1 函数时绑定显式
+package entry；实际剩余行数至少四行时消费四行，否则只消费一行。这与原 IME 的
+M4/M1 分派及激活布局一致，单行角色也可处理 prefill 的尾行。每次要求 32-element block、
+完整 16 列 cohort，并传入原始输出行距。权重准备、激活量化、分块和线程池仍归上游。
+未绑定的角色及不满足该 row-tile 合同的调用保留原 IME 函数；reference 模式
+在函数选择前跳过 Weft。此绑定要求生成 artifact 实际使用 IME1，不接受仅声明扩展的 RVV 程序。
 
 `weft/ggml.h` 提供 registration、kernel name 和按 weight type 累积的 counters：矩阵节点数、
 原 extra-buffer 节点数、Weft vec-dot 次数/结果数、通用路径的 activation quantize 次数/元素数。
-并发线程使用独立 counters；线程退出时归并。图运行前后差值给出该段工作的命中信息。计数只
+并发线程使用独立 counters；vec-dot 在 worker chunk 入口获取函数和计数指针，原调用点
+直接调用已选函数，node 结束时汇总；逐调用不查询 TLS、注册表或原子计数。
+packed tile 在节点入口绑定函数与执行核心，上游 callback 捕获该 worker
+binding 指针，逐 tile 不再查询 TLS；段末汇总计数。额外提供
+Weft quantizer 次数及 `ggml_weft_ime1_calls()` packed tile 次数。
+线程退出时归并，图运行前后差值给出该段工作的命中信息。计数只
 表示实际覆盖范围，extra-buffer 内部的量化不冒充通用量化计数，也不能从命中数推导模型加速。
+
+worker 在每次 graph 的 NUMA/核心设置后开启新的能力检查作用域。无外部 abort/custom
+callback 的原生 graph 保持 RVV permission，原生 IME 的亲和性收窄也保持已有检查成立；
+每个实际使用的 vec-dot/quantizer 入口在此作用域内只检查一次，packed IME 入口也只做
+一次执行能力检查与必要的亲和性收窄。缓存按具体入口区分，每次 graph 开始时清空。图含外部 callback 时，
+每个矩阵节点仍检查；graph 结束后的核心恢复不能把检查状态带入下一次 graph。
 
 ## 机制对照与复现入口
 
@@ -162,7 +197,7 @@ Weft 的对应责任在 `python/weft/runtime/dispatch.py:8` 与 `lib/Runtime/Bin
 
 上游 GGML `ggml/src/ggml-cpu/ggml-cpu.c` 的矩阵计算实现分别提供
 worker vec-dot、共享量化与间接矩阵入口；`integrations/llama.cpp/adapter.cpp:234` 只选择显式
-绑定并在 worker 工作段验证目标。这一边界让 GGML 保有 traversal、threadpool、workspace 和
+绑定并在 worker node 工作段验证目标；packed tile 在其实际 worker 节点入口绑定扩展。这一边界让 GGML 保有 traversal、threadpool、workspace 和
 persistent weight 布局，Weft compiler 保有自己程序内部的物理决定。
 
 `examples/repro/weft/native_package.py` 用既有作者程序构建可消费包；同目录 CMake 入口构建

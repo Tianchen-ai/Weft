@@ -29,6 +29,10 @@ kernel local-storage上界；不能只在terminal translator中出现。
 一对一RVV operation由leaf固定 intrinsic family，value type固定SEW/LMUL/`vl`/register parts，
 access或conversion固定operand form。terminal lowering只把这些事实投影为Clang RVV spelling。
 
+`rvv.convert.i16-f32` 按源 signedness 选择 `vfwcvt.f.x.v` 或 `vfwcvt.f.xu.v`。
+转换保持逻辑坐标与 active lanes，结果 SEW/LMUL 为输入的两倍；i16/u16 的每个整数均可
+由 f32 精确表示。该局部转换不改变前后整数运算或浮点累加的边界。
+
 f32 `log` 可以选择 `rvv.log-approx-f32` 的闭合数值序列。正次正规数先精确乘 `2^23`，
 拆分 exponent 与 mantissa，将 mantissa 归约到 `[sqrt(1/2),sqrt(2)]`；随后用
 `z=(m-1)/(m+1)` 的奇次级数到 11 次及分裂的 `ln(2)` 重建结果。级数来自
@@ -85,11 +89,38 @@ sequence。改变group、unroll、lane operand或memory form会产生另一份ph
 emitter分支选择。
 
 普通 `rvv_contract_step` 是纯数值 scalar/vector FMA；两端所有 reduction 坐标已由前置
-projection 消去。完整 free-axis part/lane 映射由类型确定，整数 widening 与存储解码各有
-独立 op。step 不消费 memory descriptor，也不根据 binding kind 增加读取。
+projection 消去。完整 free-axis part/lane 映射由类型确定。两个单 use 的 signed-i16→i32
+widen 可以与同宽整数 step 合成 `rvv.vwmacc.vx`：输入保持 i16，accumulator/result 为 i32，
+lane 坐标一致且 LMUL 精确加倍，目标必须声明 widening integer 能力。其整数结果遵循
+原乘加的有限位宽合同。存储解码仍是独立 op；step 不消费 descriptor 或隐式增加读取。
+
+`project_reduction_operand` 从完整 numeric value 投影一个显式 reduction 坐标，保留所有
+free-axis 的 time/lane/replica 映射。除 RVV lane/time 之外，它也支持 scalar tuple 的
+time/replica 坐标；共享寄存器坐标分析确定每个结果 part 的来源，不增加 memory read。
+
+`fma` 是普通逐元素浮点融合乘加，当前 leaf 为 `scalar.fma`、`rvv.vfmacc.vv/vf`。
+它只消费同精度 scalar 或相同布局、相同有效域的 numeric carriers；不包含转换、读取、
+归约或调度屏障。scalar 发射显式 FMA builtin，RVV 发射已选 intrinsic。
+
+`rvv_integer_mac` 使用 `rvv.vmacc.vx` 实现同宽整数的模乘加。vector、accumulator 与 result
+具有相同的完整 type，multiplier 是相同元素类型的 scalar；每个 part 保留原 active lanes。
+它没有 widening、saturation、读取或额外临时载体，不能跨过显式整数精度边界。
+
+两个同型整数 operand 分别扩到双倍位宽后相乘，可以选择已有的 `rvv_widen_multiply`。
+选择要求相同 signedness、完整有效域、相同坐标分解与合法的双倍 SEW/LMUL；不跨越
+其它 cast/narrow，也不复用仍被其它节点观察的 widen 结果。
+
+`extract` 的 `rvv.extract.regular-scalar` leaf 消费一个完整的 rank-1 register table。
+`index_pattern` 保存 base/stride/repeat，另有可选的 unsigned scalar base operand；坐标分析
+必须证明每个结果 carrier 内的 index 相同。leaf 参数保存每个 carrier 的相对 index，
+translator 直接发射 `vrgather.vx`，保留动态 base 的整数宽度与加法 wrap，不构造 index vector。
+layout 改写后重新核验 carrier 映射并重选 leaf；最终 IR 不能留下未选择的 leaf。
 
 `convert_layout`同样是terminal physical op。source/result type和`ConversionAttr`唯一决定
 split/merge/slide/splat/extract；translator实现该映射不等于重新推导layout。
+若完整 carrier 的切片恰好对齐目标的整数 LMUL 子寄存器，`lane_repack` 使用 `vget/vset`
+拼写切分与合并；共享坐标分析同时证明 VLEN、完整覆盖与切片边界，资源合同不再计入
+不需要的 slide scratch。其余切片保留显式 slide 与对应临时量。
 
 普通 BinaryOp 的 `rvv.<instruction>.vv.broadcast` leaf 可消费轴严格嵌入结果的两个 RVV
 operand。共享轴的 time/lane/replica 必须一致，缺失 lane 轴由 type 决定的 index/gather 在该
@@ -111,6 +142,9 @@ insert 拼回成组布局。不会用多次宽 masked multiply 反复经过整�
 `rvv.splat.local` 与 `ime.zero.local` 分别是已经选定的 scalar splat 和 fragment zero 的
 局部生成方式。typed asm 使 system compiler 保留该生成点，不将它们提升成长期存活的
 零模板。它们仍是独立 Physical operations，不把初始化藏进 MMA，也不引入用户 memory effect。
+`ime.zero.local-prefix` 的 leaf 参数另行固定初始化载体的 LMUL。只有逻辑 cells 恰好填满
+一个更窄的合法载体时才可选择；局部 asm 清零该前缀，结果与 MMA 仍保留完整硬件 fragment
+类型及寄存器资源。非逻辑行不能成为可观察结果，不为它们复制或初始化整组零模板。
 
 `rvv_masked_negate` 在 mask bit 为 1 时对 signed integer data 取负，否则保留 data；
 result 的完整 type 不变，逐 lane 保留该整数宽度的运算边界。mask 来自同一读取点的
@@ -118,6 +152,12 @@ result 的完整 type 不变，逐 lane 保留该整数宽度的运算边界。m
 SEW/LMUL mask ratio 必须与 data 一致。leaf 固定为 `rvv.masked-negate`，每个 physical
 part 只拼写同宽 `vneg` 与 `vmerge`；一个额外 data carrier 计入 temporary groups。
 它不包含数据 widening、浮点 scale、reduction 或额外读取，也不在 translator 匹配表达式。
+
+`rvv_regular_repeat_scalar_load` 的 natural、repeat=1 形式也可供应完整的多维 scalar
+window。source field 是一维连续 i8/i16/i32 storage；`source_count` 等于结果 shape 的
+完整乘积，`part_bases` 按结果 layout 的坐标映射到行优先线性偏移。每个源元素恰读一次，
+结果必须 full-valid，不能以部分 physical extent 代替完整 shape。它复用普通 scalar 字段
+读取，保留原 base 的求值宽度后再作地址偏移，不包含 vector extraction 或数值计算。
 
 `field_read` 是 Read-effect 的 terminal transfer：input 保留 encoded field/projection 的
 原 load/快照身份，access 固定读取与 bit mapping，result 是具有完整布局的 RVV/scalar numeric SSA。
@@ -193,6 +233,16 @@ fragment。sub-byte 数值由独立 pure `ime_fragment_decode` 恢复，shift �
 raw-load 的 packing 必须匹配已注册 capability 的 operand role；其 tail 为 `agnostic`，只定义
 packing 的逻辑 byte cells。非逻辑行不承诺零填充，也不能经 MMA/handoff 成为可观察输出；
 部分有效 atom 仍由 capability 的 active shape 限定，不能按较大硬件容量扩展作者 domain。
+单个逻辑行的自然 i8 field 在非交错 record 中也可直接供应 fragment：row partition 必须为一，
+内层 point 必须按 atom 宽度对齐并完整覆盖该次读取。它沿用原 record 地址，不要求额外交错或清零。
+完整的二或四个 byte atom 各占一个 RVV register、且目标支持对应 LMUL 时，可选择
+`ime.field-raw-load.grouped`。一次连续读取形成整个 register group，按固定 subregister
+坐标取出原有 fragments；访问字节和 fragment 次序不变，结果本身承载整组，不另占 vector
+temporary。相同几何下，`ime.decode.grouped-bits` 与 `ime.fragment.add/sub.grouped` 对整组
+执行原有 byte-local 运算；后者要求同型 fragment operands，仍遵守显式 lhs copy/reuse。
+`ime.field-raw-load.scalar-prime` 只适用于完整有效的二至四 atom 连续 byte 供给：先 scalar
+读取整个供给的最后一个有效字节，再执行原有 vector loads。读取范围不扩展，原 packing、
+fragment 数与临时资源不变；这是同一局部 load 的固定序列，不跨迭代预取或引入私有 buffer。
 physical index 的有界同余推导可把该 shift 冻结成常量。unsigned byte-local decode 的
 shift=0 省右移，shift=8-bits 省 mask；signed decode 仍作必要的 sign extension。未知 shift
 保持完整已选 decode，不由 terminal 遍历 producer 图重新证明常量。
@@ -205,13 +255,19 @@ LMUL 可合法扩到 m1；非 full validity 必须与 fragment 一致，不接�
 `ime_fragment_row_broadcast` 将上述完整 signed-byte row value 展开为具有相同 typed packing
 的 operand fragment；首批只支持 atom 内列宽 8。`ime.rows.local` 用一个局部 index 依次生成
 至多四个 atom 的 row gather，输出和 index 同时保留，temporary groups 为 atom 数加一。
+二至四 atom 还可选择 `ime.rows.indices`，用显式 RVV intrinsic 形成各 atom 的常量 index
+并执行 gather；这些纯常量允许 system compiler 移出重复执行区间。所有输出与 index 的
+联合临时上界为两倍 atom 数，不能隐藏额外寄存器或将 index 生成解释成新的作者操作。
+当前选择器仅在 partial-row atom 上采用该形式；完整行 atom 的浮点 epilogue 驻留更宽，
+采用 local-index 拼写限制 index 的实际存活区间，避免系统编译器提升多个 index 后产生 spill。
 完整有效硬件行的 realization 可选择 `ime.rows.byte-repeat`：source u8 位模式逐 lane 扩到
 u64，乘 `0x0101010101010101`，再重解释并拆为原序 i8 fragments。source 与宽 carrier 必须
 恰好填满对应 lanes，target 支持 SEW64 与所需 LMUL；最大乘积为 `UINT64_MAX`，负 i8 的
 位模式也保持。每个源 lane 只复制到自身的八个列位置，inactive 行不混入其它有效行。
-宽输入/结果的联合临时上界为两倍 atom 数；部分有效硬件行默认保留 local-index realization。
-这里的硬件有效行由 capability 的 `activeMFactor/mFactor` 决定，不等于 Value 的
-`validity=full/tail`。byte-repeat 要求 row-major packing、只沿 row 轴重复且行数完全覆盖
+宽输入/结果的联合临时上界为两倍 atom 数；未覆盖完整 operand packing 行的供应保留
+local-index realization。行覆盖按 operand role 的 packing 判断：M1 限制 lhs/结果的 M 行，
+不会缩小 rhs 的 N 行；不能用全局 `activeMFactor/mFactor` 代替该检查。
+byte-repeat 要求 row-major packing、只沿 row 轴重复且行数完全覆盖
 source lanes；逻辑有效前缀 `p` 因而恰好映射到前 `8p` 个字节，支持原有 tail 合同。
 同一个展开结果可供后续多个 pointwise 使用，原 numeric input 与读取身份不变。pointwise
 也可直接消费同型 fragment rhs；`lhs_policy=copy/reuse` 是显式资源选择，reuse 必须证明 lhs
@@ -222,6 +278,9 @@ ISA capability、packing、fragment groups、私有 scratch 与 clobbers 的唯�
 profile 与 IR dialect 消费；`FragmentOps.cpp` 负责属性序列化及针对该合同的 verifier，
 `IME/FragmentMaterialization.cpp` 物化 selected product，`IME/FragmentEmission.cpp` 实现拼写。
 属性不能用一个已知 instruction key 冒充不同的 dtype、shape、VLEN 或寄存器约束。
+任何通过局部 asm 改写向量配置的拼写必须显式 clobber `vl` 与 `vtype`，包括 MMA、局部
+初始化与 row-index 生成；普通 RVV local splat 同样遵守。两者是机器状态而非 vector register
+groups，不能只声明 GPR scratch 并依赖 system compiler 把 asm 偶然保留在原位置。
 MMA 使用 typed register operands 和 tied、early-clobber accumulator；vector register 编号交给
 system compiler 的寄存器分配，但资源数与不重叠约束已固定。leaf 为仍被其它 SSA use 引用的
 旧 accumulator 按 atom 数预留 result copy 的 fragment groups，并计入未被 operand 覆盖的固定

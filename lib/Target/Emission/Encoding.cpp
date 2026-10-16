@@ -1,6 +1,5 @@
 #include "Emitter.h"
 #include "Weft/Dialect/RISCV/IR/Layout.h"
-#include "Weft/Dialect/RISCV/IR/Layout.h"
 
 namespace weft::riscv_emission {
 
@@ -35,6 +34,37 @@ mlir::LogicalResult Emitter::compileField(riscv::FieldOp operation) {
 
 mlir::LogicalResult Emitter::compileExtract(riscv::ExtractOp operation) {
   Binding binding = bindings.lookup(operation.getInput());
+  if (instructionOf(operation.getOperation()) == "rvv.extract.regular-scalar") {
+    auto source = materializeNumeric(operation.getInput(), std::move(binding));
+    if (mlir::failed(source) || source->kind != Binding::Kind::Vector || source->parts.size() != 1)
+      return fail(operation, "regular gather requires one complete numeric table");
+    std::string base, baseType;
+    if (!operation.getIndices().empty()) {
+      auto value = bindings.lookup(operation.getIndices().front());
+      auto spelling = scalarCType(operation.getIndices().front().getType());
+      if (value.kind != Binding::Kind::Scalar || !spelling)
+        return fail(operation, "regular gather base requires a scalar binding");
+      base = value.scalar;
+      baseType = *spelling;
+    }
+    Binding result;
+    result.kind = Binding::Kind::Vector;
+    const std::string suffix = vectorSuffix(operation.getResult());
+    const std::string type = vectorType(operation.getResult());
+    for (auto [part, index] : llvm::enumerate(operation.getLeaf().getParameters().asArrayRef())) {
+      std::string coordinate = std::to_string(index);
+      if (!base.empty())
+        coordinate = "((" + baseType + ")(" +
+            base + " + " + coordinate + "))";
+      std::string name = fresh("regular_gather");
+      line(type + " " + name + " = __riscv_vrgather_vx_" + suffix + "(" +
+           source->parts.front() + ", " + coordinate + ", " +
+           partVL(operation.getResult(), part) + ");");
+      result.parts.push_back(std::move(name));
+    }
+    bindings[operation.getResult()] = std::move(result);
+    return mlir::success();
+  }
   if (riscv::fieldReadProjection(operation.getResult())) {
     auto projection = fieldProjections.find(operation.getInput());
     if (projection == fieldProjections.end())
@@ -1527,7 +1557,9 @@ Binding Emitter::emitInterleavedField(mlir::Value result,
   if (lanesInRecord) {
     const int64_t partition = logicalPartition ? logicalPartition : field->shape.back();
     const int64_t contiguous = field->access.getMapping() == "natural"
-                                   ? field->access.getFieldChunkBytes() / std::max<int64_t>(1, logicalWidth / 8)
+                                   ? (owner.interleaveRows == 1
+                                          ? partition
+                                          : field->access.getFieldChunkBytes() / std::max<int64_t>(1, logicalWidth / 8))
                                    : std::min(field->access.getFieldChunkBytes(), field->access.getLayerSize());
     if (physicalLanes(result) > contiguous || partition % physicalLanes(result) ||
         contiguous % physicalLanes(result))

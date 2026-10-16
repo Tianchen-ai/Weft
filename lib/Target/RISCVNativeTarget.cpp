@@ -31,6 +31,7 @@ bool discoverMatrixExtensions(weft::RISCVNativeTarget &result,
   std::optional<int> processor;
   std::optional<uint64_t> vendor, architecture;
   std::string isa;
+  bool commonFenceI = true;
   auto finish = [&]() {
     if (!processor ||
         std::find(result.cpus.begin(), result.cpus.end(), *processor) == result.cpus.end())
@@ -42,6 +43,7 @@ bool discoverMatrixExtensions(weft::RISCVNativeTarget &result,
     }
     llvm::SmallVector<llvm::StringRef> features;
     llvm::StringRef(isa).split(features, '_');
+    commonFenceI &= llvm::is_contained(features, "zifencei");
     for (const auto &extension : weft::riscvExtensions()) {
       for (const auto &match : extension.nativeMatches) {
         if (std::find(features.begin(), features.end(), match.isaFeature) == features.end())
@@ -108,6 +110,10 @@ bool discoverMatrixExtensions(weft::RISCVNativeTarget &result,
     error = "native CPU affinity contains processors with no ISA facts in /proc/cpuinfo";
     return false;
   }
+  // Linux hwprobe/LLVM's feature vocabulary does not enumerate Zifencei.
+  // Require the OS ISA declaration on every CPU in the discovered affinity.
+  if (commonFenceI)
+    result.isaExtensions.emplace("zifencei", std::make_pair(2U, 0U));
   return true;
 }
 } // namespace
@@ -202,6 +208,10 @@ bool weft::queryNativeRISCVTarget(RISCVNativeTarget &result,
   result.isaExtensions.clear();
   for (const auto &[name, version] : (*isa)->getExtensions())
     result.isaExtensions.emplace(name, std::make_pair(version.Major, version.Minor));
+  // Zicbop consists entirely of ORI-to-x0 HINT encodings: execution on base I
+  // is legal even when the implementation ignores prefetch. This is an
+  // execution contract, not evidence of a cache engine or its latency.
+  result.isaExtensions.emplace("zicbop", std::make_pair(1U, 0U));
   return discoverMatrixExtensions(result, error) &&
       discoverRISCVDataCaches(result.cpus, result.dataCaches, result.profile.dataCache, error);
 #else

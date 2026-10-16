@@ -2368,6 +2368,20 @@ def WeftRISCV_RVVTileContractOp : WeftRISCV_LeafOp<"rvv_tile_contract", [Pure]> 
   let hasVerifier = 1;
 }
 
+def WeftRISCV_RVVIntegerMACOp : WeftRISCV_LeafOp<"rvv_integer_mac", [Pure]> {
+  let arguments = (ins WeftRISCV_ValueType:$vector, AnyType:$multiplier,
+                       WeftRISCV_ValueType:$accumulator, WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_ValueType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_FMAOp : WeftRISCV_LeafOp<"fma", [Pure]> {
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs, AnyType:$accumulator,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
 def WeftRISCV_RVVFMAIssueOp : WeftRISCV_LeafOp<"rvv_fma_issue", [Pure]> {
   let arguments = (ins WeftRISCV_ValueType:$vector, AnyType:$multiplier,
                        WeftRISCV_ValueType:$accumulator, Variadic<Index>:$lengths,

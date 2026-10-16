@@ -3408,6 +3408,11 @@ coalescePartialOperand(mlir::Builder &builder, riscv::ValueType source,
   const int64_t vl = source.getLayout().getVl() * factor;
   if (!llvm::is_contained(target.getLegalLMULEighths().asArrayRef(), lmul))
     return std::nullopt;
+  auto replicas = riscv_internal::staticProduct(replica);
+  const int64_t groupsPerReplica = std::max<int64_t>(1, (lmul + 7) / 8);
+  if (!replicas || *replicas <= 0 ||
+      *replicas > target.getVectorRegisters() / groupsPerReplica)
+    return std::nullopt;
   auto layout = riscv::LayoutAttr::get(
       builder.getContext(), "rvv", source.getAxisIds(),
       riscv_internal::integers(builder, time),
@@ -3415,7 +3420,7 @@ coalescePartialOperand(mlir::Builder &builder, riscv::ValueType source,
       riscv_internal::integers(builder, replica),
       source.getLayout().getFragmentFactors(),
       source.getLayout().getLocalFactors(), source.getLayout().getSew(), lmul,
-      vl, std::max<int64_t>(1, (lmul + 7) / 8),
+      vl, groupsPerReplica * *replicas,
       source.getLayout().getValidity());
   auto result = riscv::ValueType::get(builder.getContext(),
                                       source.getElementType(), source.getShape(),

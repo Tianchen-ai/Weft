@@ -106,6 +106,11 @@ public:
     getOperation().walk<mlir::WalkOrder::PostOrder>(
         [&](mlir::LoopLikeOpInterface loop) { loops.push_back(loop); });
     for (mlir::LoopLikeOpInterface loop : loops) {
+      // A fully unrolled loop can retain its Level boundary with one physical
+      // iteration. Hoisting its supplies saves no execution and makes every
+      // decoded part resident across the whole body instead of its consumers.
+      if (hasAtLeastIterations(loop, 1) && !hasAtLeastIterations(loop, 2))
+        continue;
       // A memory read may only move out when this body is known to execute.
       // Unknown effects and guards remain barriers even if they have no
       // registered Write instance. Numeric SSA motion is a separate question.

@@ -7,6 +7,11 @@
 
 namespace weft::riscv {
 
+// Pointwise contraction has no reduction or closed scheduling frontier. The
+// vector operand is lhs; rhs is either the identical carrier or a scalar.
+llvm::StringRef pointwiseFMAInstruction(mlir::Type lhs, mlir::Type rhs,
+                                      mlir::Type result);
+
 // A finite set of independent lane-wise FMA updates. All operands are numeric
 // values; memory supply, reduction traversal and initialization remain IR.
 struct FMAIssueGeometry {

@@ -1,5 +1,24 @@
 # 基线选择与性能归因
 
+## 性能开发入口
+
+算子计时、baseline 比较和 llama.cpp E2E 使用独立的 [Weft Bench](https://github.com/Tianchen-ai/Weft-Bench) 仓库。
+安装该仓库后，以外部 JSON 配置机器、编译器和模型：
+
+```sh
+export WEFT_BENCH_CONFIG=/path/to/bench.local.json
+weft-bench op --suite quick --target sg2044
+weft-bench op q4_k_dot --target k1 --impl weft,ggml
+weft-bench e2e llama2-7b-q4_0 --target k1 --phase both
+weft-bench compare runs/before.json runs/after.json
+```
+
+默认输出原生调用耗时及 CSV/JSON；默认不采样热点、不重跑全部输入规模。
+`--baseline` 复用已保存结果，`--profile` 按需采样模型阶段。
+旧 `examples/run` 测量入口已由该工具替代，历史成绩和旧 driver 已归档到 bench 的本地历史区。
+本仓库保留作者 kernel、编译器/runtime、llama.cpp 集成和使用示例；测量与回归由 Weft Bench 维护。
+下文说明编译器与算法的职责，具体运行参数和输出接口以 bench 文档为准。
+
 ## 1. 实验服务于编译器
 
 Weft 的目标是建立语言和编译器：

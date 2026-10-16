@@ -92,6 +92,12 @@ LogicalResult readonlyUnit(Operation *operation, bool admission = false) {
       return WalkResult::interrupt();
     }
     if (!isPipelineShapeBinding(nested) && !riscv::hasOnlyReadEffects(nested)) {
+      // A copied register-fragment accumulator writes only its new SSA result.
+      // It has no external memory effect; stage dependencies preserve the
+      // accumulator chain and later resource closure decides physical reuse.
+      if (auto mma = dyn_cast<riscv::IMEFragmentMMAOp>(nested);
+          mma && !mma.getMemoryClobber() && mma.getAccumulatorPolicy() == "copy")
+        return WalkResult::advance();
       if (auto effects = dyn_cast<MemoryEffectOpInterface>(nested)) {
         SmallVector<MemoryEffects::EffectInstance> instances;
         effects.getEffects(instances);
@@ -117,6 +123,56 @@ LogicalResult readonlyUnit(Operation *operation, bool admission = false) {
 bool replayableDescriptor(Operation *operation) {
   return isa<riscv::FieldOp, riscv::SliceOp, riscv::SubviewOp,
              riscv::ReaxisOp, riscv::ExtentOp>(operation);
+}
+
+bool contractionConsumer(Operation *operation) {
+  if (!isa<riscv::RVVWidenMultiplyOp, riscv::RVVWidenDotOp,
+           riscv::IMEFragmentMMAOp>(operation))
+    return false;
+  // Indexed storage projections still require their address/shape owner in
+  // the consuming iteration. Only already-numeric or direct field supplies
+  // establish this earlier frontier.
+  for (Value operand : operation->getOperands()) {
+    SmallVector<Value> indices;
+    if (riscv::fieldReadProjection(operand, &indices) && !indices.empty())
+      return false;
+  }
+  return true;
+}
+
+LogicalResult materializeContractionReads(scf::ForOp loop) {
+  IRRewriter rewriter(loop.getContext());
+  llvm::DenseMap<Value, Value> reads;
+  for (Operation &operation : loop.getBody()->without_terminator()) {
+    if (!contractionConsumer(&operation)) continue;
+    for (OpOperand &operand : operation.getOpOperands()) {
+      Value input = operand.get();
+      SmallVector<Value> indices;
+      auto field = riscv::fieldReadProjection(input, &indices);
+      auto type = dyn_cast<riscv::ValueType>(input.getType());
+      if (!field || !type) continue;
+      if (auto found = reads.find(input); found != reads.end()) {
+        operand.set(found->second);
+        continue;
+      }
+      auto access = input.getDefiningOp()->getAttrOfType<riscv::AccessAttr>("access");
+      if (!access)
+        return operation.emitError("contraction pipeline supply has no memory access");
+      auto temporary = riscv::fieldReadTemporaryGroups(input, type, access, indices);
+      if (!temporary)
+        return operation.emitError("contraction pipeline supply has no closed numeric read");
+      rewriter.setInsertionPoint(&operation);
+      auto instruction = riscv::fieldReadInstruction(input, type, access);
+      auto read = rewriter.create<riscv::FieldReadOp>(operation.getLoc(), type,
+          input, indices, access,
+          leaf(rewriter, "transfer", "field-read", instruction, instruction,
+               0, 0, *temporary, 0, "none", "exact"));
+      copyOrigin(input.getDefiningOp(), read);
+      reads[input] = read.getResult();
+      operand.set(read.getResult());
+    }
+  }
+  return success();
 }
 
 bool carryType(Type type) {
@@ -297,6 +353,9 @@ FailureOr<std::optional<PipelineSchedule>> riscv_internal::schedulePipeline(scf:
   PipelineSchedule result;
   result.loop = loop;
   if (failed(loopContract(loop, result.descending, true))) return failure();
+  // Freeze actual numeric reads before carrying the supply to another stage;
+  // an encoded storage projection is not a buffered value.
+  if (failed(materializeContractionReads(loop))) return failure();
   SmallVector<Operation *> operations;
   llvm::SmallPtrSet<Operation *, 32> consumerSet;
   unsigned edges = 0;
@@ -305,6 +364,11 @@ FailureOr<std::optional<PipelineSchedule>> riscv_internal::schedulePipeline(scf:
       return loop.emitError("pipeline operation domain exceeds its explicit bound"), failure();
     if (failed(readonlyUnit(&operation, true))) return failure();
     operations.push_back(&operation);
+    // A contraction starts the consuming stage even when its accumulator is
+    // local to this iteration. Otherwise all dot work becomes a producer and
+    // only the final scalar carry update overlaps the following iteration.
+    if (contractionConsumer(&operation))
+      consumerSet.insert(&operation);
     auto dependencies = stageDependencies(&operation);
     if (failed(dependencies)) return failure();
     for (Value operand : *dependencies) {

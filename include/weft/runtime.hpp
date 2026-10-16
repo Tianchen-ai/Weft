@@ -168,6 +168,10 @@ public:
     weft_error detail{};
     check(weft_kernel_check_thread(value_, &detail), detail);
   }
+  void bind_thread() const {
+    weft_error detail{};
+    check(weft_kernel_bind_thread(value_, &detail), detail);
+  }
   weft_native_entry entry() const {
     weft_error detail{}; weft_native_entry result;
     check(weft_kernel_get_entry(value_, &result, &detail), detail);
@@ -321,6 +325,11 @@ public:
     weft_error detail{}; weft_kernel *result;
     check(weft_package_kernel(value_, name.c_str(), &result, &detail), detail);
     return kernel(result);
+  }
+  bool has_binding_group(const std::string &group) const {
+    weft_error detail{}; bool present;
+    check(weft_package_has_binding_group(value_, group.c_str(), &present, &detail), detail);
+    return present;
   }
   std::vector<std::pair<std::string, std::string>> bindings(const std::string &group) const {
     weft_error detail{}; size_t count;

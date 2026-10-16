@@ -215,7 +215,7 @@ public:
       if ((llvm::any_of(operation->getOperandTypes(), grouped) ||
            llvm::any_of(operation->getResultTypes(), grouped)) &&
           !mlir::isa<riscv::IMEUnpackOp, riscv::NewOp, riscv::UnaryOp,
-                     riscv::BinaryOp, riscv::CastOp, riscv::WidenOp, riscv::NarrowOp,
+                     riscv::BinaryOp, riscv::FMAOp, riscv::CastOp, riscv::WidenOp, riscv::NarrowOp,
                      riscv::RVVAxisBroadcastOp, riscv::RVVSplatOp, riscv::ConvertLayoutOp,
                      riscv::RegisterMaterializeOp, mlir::scf::ForOp,
                      mlir::scf::IfOp, mlir::scf::YieldOp>(operation)) {
@@ -223,8 +223,28 @@ public:
         failed = true;
       }
       mlir::Value region;
-      if (auto load = mlir::dyn_cast<riscv::LoadOp>(operation)) region = load.getRegion();
-      if (auto store = mlir::dyn_cast<riscv::StoreOp>(operation)) region = store.getRegion();
+      mlir::Value memoryValue;
+      if (auto load = mlir::dyn_cast<riscv::LoadOp>(operation)) {
+        region = load.getRegion();
+        memoryValue = load.getResult();
+      }
+      if (auto store = mlir::dyn_cast<riscv::StoreOp>(operation)) {
+        region = store.getRegion();
+        memoryValue = store.getValue();
+      }
+      if (auto type = memoryValue ? mlir::dyn_cast<riscv::ValueType>(memoryValue.getType())
+                                  : riscv::ValueType();
+          type && type.getLayout().getCarrier() == "rvv") {
+        auto memory = mlir::dyn_cast<riscv::MemDescType>(region.getType());
+        auto encoding = memory ? mlir::dyn_cast<kernel::EncodingType>(memory.getEncoding())
+                               : kernel::EncodingType();
+        if (encoding && encoding.getKind() == "dense" &&
+            llvm::count_if(type.getLayout().getLaneFactors().asArrayRef(),
+                           [](int64_t n) { return n > 1; }) > 1) {
+          operation->emitError("dense transfer requires one lane axis and explicit carrier conversions");
+          failed = true;
+        }
+      }
       if (region && kernel::hasDynamicSubviewExtent<riscv::SubviewOp, riscv::SliceOp, riscv::FieldOp>(region) &&
           llvm::any_of(riscv_internal::logicalShape(region.getType()), [](int64_t n) { return n < 0; })) {
         operation->emitError("dynamic shaped subview access has no explicit bounded value realization");
@@ -647,7 +667,8 @@ public:
         const bool registerExtract =
             access && access.getForm() == "register" &&
             leaf.getEngine() == "rvv" && leaf.getFamily() == "extract" &&
-            leaf.getInstruction() == "rvv.extract.vrgather";
+            (leaf.getInstruction() == "rvv.extract.vrgather" ||
+             leaf.getInstruction() == "rvv.extract.regular-scalar");
         const bool laneReplicaExtract =
             access && access.getForm() == "register" &&
             leaf.getEngine() == "rvv" && leaf.getFamily() == "extract" &&
@@ -1080,7 +1101,7 @@ public:
             riscv::RVVGroupedMacStepOp, riscv::RVVLayeredRecordLoadOp,
             riscv::RVVLayeredWindowOp,
             riscv::RVVLayeredStreamOp, riscv::RVVProjectedLayeredStreamOp,
-            riscv::RVVContractStepOp, riscv::RVVTileContractOp, riscv::RVVFMAIssueOp>(operation);
+            riscv::RVVContractStepOp, riscv::RVVTileContractOp, riscv::FMAOp, riscv::RVVFMAIssueOp>(operation);
         for (mlir::Value result : operation->getResults()) {
           if (auto value = mlir::dyn_cast<riscv::ValueType>(result.getType())) {
             llvm::StringRef carrier = value.getLayout().getCarrier();

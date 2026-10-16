@@ -204,9 +204,12 @@ mlir::FailureOr<mlir::Value> weft::riscv_internal::materializeFragmentProduct(
     auto point = bits < 8 ? originPoint(projection, innerAxis) : riscv::PhysicalPointOp();
     if (bits < 8 && !point)
       return {};
+    const bool grouped = riscv::supportsFragmentGroupedLoad(fragment,
+        operation->getParentOfType<riscv::KernelOp>().getTarget());
+    const char *loadSpelling = grouped ? "ime.field-raw-load.grouped" : "ime.field-raw-load";
     auto read = rewriter.create<riscv::IMEFragmentStorageLoadOp>(operation->getLoc(), fragment,
-        projection, *access, riscv_internal::leaf(rewriter, "ime", "fragment-storage-load", "ime.field-raw-load",
-                                                "ime.field-raw-load", 0, 0, 1, fragment.getResourceGroups(), "none", "agnostic"));
+        projection, *access, riscv_internal::leaf(rewriter, "ime", "fragment-storage-load", loadSpelling,
+            loadSpelling, 0, 0, grouped ? 0 : 1, fragment.getResourceGroups(), "none", "agnostic"));
     copyOrigin(projection.getDefiningOp(), read);
     mlir::Value supplied = read.getResult();
     if (bits < 8) {
@@ -223,10 +226,11 @@ mlir::FailureOr<mlir::Value> weft::riscv_internal::materializeFragmentProduct(
       if (access->getOrder() == "hi_first")
         layerIndex = rewriter.create<mlir::arith::SubIOp>(operation->getLoc(), constant(8 / bits - 1), layerIndex);
       auto shift = rewriter.create<mlir::arith::MulIOp>(operation->getLoc(), layerIndex, width);
+      const char *decodeSpelling = grouped ? "ime.decode.grouped-bits" : "ime.decode.bits";
       auto decoded = rewriter.create<riscv::IMEFragmentDecodeOp>(operation->getLoc(), fragment,
           supplied, shift.getResult(), bits, integer.isSigned(),
-          riscv_internal::leaf(rewriter, "ime", "fragment-decode", "ime.decode.bits", "ime.decode.bits",
-                              0, 0, 1, fragment.getResourceGroups()));
+          riscv_internal::leaf(rewriter, "ime", "fragment-decode", decodeSpelling, decodeSpelling,
+                              0, 0, grouped ? 0 : 1, fragment.getResourceGroups()));
       copyOrigin(projection.getDefiningOp(), decoded);
       supplied = decoded.getResult();
     }

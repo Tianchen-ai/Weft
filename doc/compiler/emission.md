@@ -9,6 +9,10 @@ typed program entities；每个target operation也已有闭合的[local leaf](le
 translator内部可以用临时binding map把SSA value对应到C expression、RVV variable、local array
 或typed fragment register。该表只保存已发射值的文本，不是跨pass decision authority。
 
+从已选 RVV carrier 提取静态第 0 个元素时，直接拼写 `vmv.x.s` / `vfmv.f.s`，不先发射
+零偏移 `vslidedown`。其它 lane 仍按明确的坐标映射移动；这只消除恒等搬运，不改变读取、
+有效域、整数位宽或浮点数值。多消费者的提取共享仍由局部 extraction binding 保存。
+
 scalar unary 与 binary 的数值结果也以其声明 C dtype 建立一次 SSA 绑定。特别是 `exp/log`
 不能作为文本宏在重复 use 或内层循环中重复执行；system compiler 可以对这些普通局部值做
 等价优化，terminal 本身不把一条已求值的数值 operation 展开成多次调用。

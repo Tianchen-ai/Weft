@@ -149,8 +149,8 @@ enum class PassID {
   Hoist, Schedule, Pipeline, SCCP, Control, Fragments, ShareWindows,
   PartialTopology, PartialAccumulators, Unroll, PartialExtractions,
   DeadLayouts, ConsumerLayouts, ByteProjections, ReplicaLoads,
-  SpecializeMemory, DenseTransfers, FMAIssues, ScalarPackets, Leaves, ScalarPrimes, Snapshots, LeafResources,
-  CSE, FuseIssues, LocalAlignment, Resources, Verify, MarkLayout, ConsumeLayout, MarkContractions, ConsumeContractions,
+  SpecializeMemory, DenseTransfers, FMAIssues, PointwiseFMA, IntegerPointwise, ScalarPackets, Leaves, ScalarPrimes, Snapshots, LeafResources,
+  LocalSupplies, CSE, FuseIssues, LocalAlignment, Resources, Verify, MarkLayout, ConsumeLayout, MarkContractions, ConsumeContractions,
   MarkPanelTransfers, ConsumePanelTransfers,
 };
 
@@ -186,11 +186,12 @@ constexpr Entry prefix[] = {
     {PassID::NestedMemory, "program-materialization"},
     {PassID::Bitplanes, "program-materialization"},
     {PassID::Hoist, "scheduling"},
+    {PassID::SCCP, "scheduling"},
+    {PassID::Fragments, "scheduling"},
     {PassID::Schedule, "scheduling"},
     {PassID::Pipeline, "scheduling"},
     {PassID::SCCP, "scheduling"},
     {PassID::Control, "scheduling"},
-    {PassID::Fragments, "partial-materialization"},
     {PassID::ShareWindows, "partial-materialization"},
     {PassID::PartialTopology, "partial-materialization"},
     {PassID::PartialAccumulators, "partial-materialization"},
@@ -210,8 +211,10 @@ constexpr Entry suffix[] = {
     {PassID::Control, "layout-finalization"},
     {PassID::SpecializeMemory, "leaf-selection"},
     {PassID::Control, "leaf-selection"},
+    {PassID::IntegerPointwise, "leaf-selection"},
     {PassID::Select, "leaf-selection"},
     {PassID::Leaves, "leaf-selection"},
+    {PassID::LocalSupplies, "leaf-selection"},
     {PassID::DenseTransfers, "leaf-selection"},
     {PassID::ScalarPrimes, "leaf-selection"},
     {PassID::Snapshots, "resource-closure"},
@@ -219,6 +222,7 @@ constexpr Entry suffix[] = {
     {PassID::CSE, "resource-closure"},
     {PassID::Control, "resource-closure"},
     {PassID::FuseIssues, "resource-closure"},
+    {PassID::PointwiseFMA, "resource-closure"},
     {PassID::ScalarPackets, "resource-closure"},
     {PassID::FMAIssues, "resource-closure"},
     {PassID::DeadLayouts, "resource-closure"},
@@ -304,10 +308,13 @@ std::unique_ptr<Pass> makePass(PassID id, const RISCVCompilerOptions &options,
   case PassID::SpecializeMemory: return createSpecializeRISCVMemoryPass();
   case PassID::DenseTransfers: return createSelectRISCVDenseTransfersPass();
   case PassID::FMAIssues: return createSelectRISCVFMAIssuesPass();
+  case PassID::PointwiseFMA: return createContractRISCVFloatingPointPass();
   case PassID::LocalAlignment: return createAlignRISCVLocalStoragePass();
   case PassID::ScalarPackets: return createSelectRISCVScalarPacketsPass();
   case PassID::Leaves: return createFinalizeRISCVLeavesPass();
+  case PassID::LocalSupplies: return createScheduleRISCVLocalSuppliesPass();
   case PassID::ScalarPrimes: return createSelectRISCVScalarLoadPrimesPass(options.scalarLoadPrime != 0);
+  case PassID::IntegerPointwise: return createContractRISCVIntegerPointwisePass();
   case PassID::Snapshots: return createMaterializeRISCVReadSnapshotsPass();
   case PassID::LeafResources: return createCloseRISCVLeafResourcesPass();
   case PassID::CSE: return createCSEPass();

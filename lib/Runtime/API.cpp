@@ -73,10 +73,16 @@ weft_status weft_kernel_check_thread(const weft_kernel *kernel, weft_error *erro
   });
 }
 
+weft_status weft_kernel_bind_thread(const weft_kernel *kernel, weft_error *error) {
+  return api(error, [&] {
+    require(kernel, WEFT_INVALID_ARGUMENT, "kernel is null");
+    kernel->value->context->bindThread(kernel->value->usedExtensions);
+  });
+}
+
 weft_status weft_kernel_get_entry(const weft_kernel *kernel, weft_native_entry *result, weft_error *error) {
   return api(error, [&] {
     require(kernel && result, WEFT_INVALID_ARGUMENT, "kernel and result are required");
-    kernel->value->context->check(kernel->value->usedExtensions);
     *result = kernel->value->entry;
   });
 }
@@ -165,6 +171,14 @@ weft_status weft_package_kernel(weft_package *package, const char *name, weft_ke
   });
 }
 void weft_package_release(weft_package *package) { delete package; }
+
+weft_status weft_package_has_binding_group(const weft_package *package, const char *group,
+                                          bool *present, weft_error *error) {
+  return api(error, [&] {
+    require(package && group && *group && present, WEFT_INVALID_ARGUMENT, "package, named group and result are required");
+    *present = package->value->bindings.find(group) != package->value->bindings.end();
+  });
+}
 
 weft_status weft_package_binding_count(const weft_package *package, const char *group,
                                        size_t *count, weft_error *error) {

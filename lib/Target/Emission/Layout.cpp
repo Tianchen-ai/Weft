@@ -180,7 +180,7 @@ Emitter::extractVectorLane(mlir::Value source, const Binding &binding,
     return found->second;
 
   const std::string suffix = vectorSuffix(source);
-  const std::string shifted =
+  const std::string shifted = laneOffset == 0 ? binding.parts[sourcePart] :
       "__riscv_vslidedown_vx_" + suffix + "(" + binding.parts[sourcePart] +
       ", " + std::to_string(laneOffset) + ", " + partVL(source, sourcePart) +
       ")";
@@ -594,10 +594,37 @@ Emitter::compileConvertLayout(riscv::ConvertLayoutOp conversion) {
     const std::string to = vectorSuffix(conversion.getResult());
     const auto sourceLayout = conversion.getInput().getType().getLayout();
     const auto resultLayout = conversion.getResult().getType().getLayout();
+    auto target = conversion->getParentOfType<riscv::KernelOp>().getTarget();
+    const bool splitRegisters = riscv::isRVVSubregisterRepack(target,
+        conversion.getInput().getType(), conversion.getResult().getType());
+    const bool joinRegisters = riscv::isRVVSubregisterRepack(target,
+        conversion.getResult().getType(), conversion.getInput().getType());
     for (const auto &slice : *slices) {
       if (slice.sourcePart >= static_cast<int64_t>(input.parts.size()))
         return fail(conversion, "lane repack source part is absent");
       std::string expression = input.parts[slice.sourcePart];
+      if (splitRegisters) {
+        const int64_t lanes = target.getVlenBits() * resultLayout.getLmulEighths() /
+                              (8 * resultLayout.getSew());
+        result.parts.push_back(fresh("register_extract"));
+        line(vectorType(conversion.getResult()) + " " + result.parts.back() +
+             " = __riscv_vget_v_" + from + "_" + to + "(" + expression + ", " +
+             std::to_string(slice.sourceOffset / lanes) + ");");
+        continue;
+      }
+      if (joinRegisters) {
+        const int64_t lanes = target.getVlenBits() * sourceLayout.getLmulEighths() /
+                              (8 * sourceLayout.getSew());
+        if (!slice.resultOffset) {
+          result.parts.push_back(fresh("register_join"));
+          line(vectorType(conversion.getResult()) + " " + result.parts.back() +
+               " = __riscv_vundefined_" + to + "();");
+        }
+        line(result.parts[slice.resultPart] + " = __riscv_vset_v_" + from + "_" + to +
+             "(" + result.parts[slice.resultPart] + ", " + std::to_string(slice.resultOffset / lanes) +
+             ", " + expression + ");");
+        continue;
+      }
       if (slice.sourceOffset)
         expression = "__riscv_vslidedown_vx_" + from + "(" + expression + ", " +
                      std::to_string(slice.sourceOffset) + ", " + std::to_string(slice.count) + ")";
@@ -1230,10 +1257,11 @@ mlir::LogicalResult Emitter::compileProjectReductionOperand(
     return mlir::failure();
   Binding input = std::move(*materialized);
   Binding index = bindings.lookup(operation.getReductionIndex());
-  if (input.kind != Binding::Kind::Vector || index.kind != Binding::Kind::Scalar) {
+  if ((input.kind != Binding::Kind::Vector && input.kind != Binding::Kind::ScalarTuple) ||
+      index.kind != Binding::Kind::Scalar) {
     std::string detail;
     llvm::raw_string_ostream stream(detail);
-    stream << "reduction operand projection requires an RVV value and scalar "
+    stream << "reduction operand projection requires a numeric tuple and scalar "
               "index; input type="
            << operation.getInput().getType() << ", input binding="
            << static_cast<unsigned>(input.kind) << ", index binding="
@@ -1251,6 +1279,36 @@ mlir::LogicalResult Emitter::compileProjectReductionOperand(
       found - inputType.getAxisIds().asArrayRef().begin());
   const int64_t lanes = inputLayout.getLaneFactors()[axisIndex];
   const int64_t streams = inputLayout.getTimeFactors()[axisIndex];
+  if (inputLayout.getCarrier() == "scalar") {
+    auto source = riscv::RegisterCoordinates::get(inputLayout);
+    auto destination = riscv::RegisterCoordinates::get(resultType.getLayout());
+    auto ctype = scalarCType(resultType.getElementType());
+    if (!source || !destination || !ctype || input.kind != Binding::Kind::ScalarTuple)
+      return fail(operation, "scalar reduction projection has no complete register coordinates");
+    Binding result;
+    result.kind = destination->parts() == 1 ? Binding::Kind::Scalar : Binding::Kind::ScalarTuple;
+    for (int64_t part = 0; part < destination->parts(); ++part) {
+      auto point = destination->logical(part);
+      if (!point) return fail(operation, "scalar reduction result coordinate is absent");
+      point->insert(point->begin() + axisIndex, 0);
+      std::string expression;
+      for (int64_t reduced = source->extents()[axisIndex] - 1; reduced >= 0; --reduced) {
+        (*point)[axisIndex] = reduced;
+        auto location = source->locate(*point);
+        if (!location || location->lane != 0 || location->part >= static_cast<int64_t>(input.parts.size()))
+          return fail(operation, "scalar reduction source coordinate is absent");
+        const auto &value = input.parts[location->part];
+        expression = expression.empty() ? value :
+            "(" + index.scalar + " == " + std::to_string(reduced) + " ? " + value + " : " + expression + ")";
+      }
+      std::string name = fresh("scalar_projection");
+      line(*ctype + " " + name + " = " + expression + ";");
+      if (result.kind == Binding::Kind::Scalar) result.scalar = std::move(name);
+      else result.parts.push_back(std::move(name));
+    }
+    bindings[operation.getResult()] = std::move(result);
+    return mlir::success();
+  }
   if (lanes == 1 && streams > 1 &&
       resultType.getLayout().getCarrier() == "rvv") {
     if (laneAxisFor(operation.getInput()) != laneAxisFor(operation.getResult()) ||

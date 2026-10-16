@@ -140,6 +140,20 @@ class Toolchain:
         cc = (executable(self.cc[0], "C compiler"), *self.cc[1:]) if native_library else self.cc
         return Toolchain(self.compiler_path(), cc, self.cflags, self.ldflags, self.dependencies)
 
+    def resolve_linker(self) -> Toolchain:
+        """Resolve only the C toolchain needed by an already selected artifact."""
+        return Toolchain(self.compiler, (executable(self.cc[0], "C compiler"), *self.cc[1:]),
+                         self.cflags, self.ldflags, self.dependencies)
+
+    def link_identity(self) -> dict:
+        return {"cc": list(self.cc), "cflags": list(self.cflags), "ldflags": list(self.ldflags),
+                "library_flags": list(LIBRARY_FLAGS), "cc_file": file_identity(self.cc[0]),
+                "cc_version": run_compiler([*self.cc, "--version"], stage="C toolchain identity"),
+                "dependencies": [file_identity(path) for path in self.dependencies],
+                "environment": {name: os.environ.get(name) for name in
+                                ("CPATH", "C_INCLUDE_PATH", "LIBRARY_PATH", "LD_LIBRARY_PATH",
+                                 "GCC_EXEC_PREFIX", "COMPILER_PATH", "SDKROOT")}}
+
     def identity(self, *, native_library: bool) -> dict:
         compiler = self.compiler_path()
         dependencies = [file_identity(path) for path in self.dependencies]
@@ -151,13 +165,9 @@ class Toolchain:
                   "compiler_version": run_compiler([compiler, "--version"], stage="compiler identity"),
                   "dependencies": dependencies}
         if native_library:
-            result.update(cc=list(self.cc), cflags=list(self.cflags), ldflags=list(self.ldflags),
-                          library_flags=list(LIBRARY_FLAGS),
-                          cc_file=file_identity(self.cc[0]),
-                          cc_version=run_compiler([*self.cc, "--version"], stage="C toolchain identity"),
-                          environment={name: os.environ.get(name) for name in
-                                       ("CPATH", "C_INCLUDE_PATH", "LIBRARY_PATH", "LD_LIBRARY_PATH",
-                                        "GCC_EXEC_PREFIX", "COMPILER_PATH", "SDKROOT")})
+            native = self.link_identity()
+            native["dependencies"] = dependencies
+            result.update(native)
         return result
 
     def link_library(self, source: Path, output: Path, target) -> list[str]:

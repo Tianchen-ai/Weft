@@ -1157,6 +1157,8 @@ class FrontendCompiler:
                 )
             if expression.id in self._shape_symbols:
                 return self._shape_symbols[expression.id]
+            if expression.id in self._auto_symbols:
+                return self._auto_symbols[expression.id]
             static = self._resolve_static(expression)
             if isinstance(static, (bool, int, float)):
                 return self._constant(static, None, expression)

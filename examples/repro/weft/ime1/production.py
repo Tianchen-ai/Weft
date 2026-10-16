@@ -12,7 +12,7 @@ import sys
 
 import weft
 from weft.runtime import Buffer, CompileOptions, Toolchain
-from weft.runtime.driver import NativeTarget
+from weft.runtime.target import NativeTarget
 
 
 def run(command, *, source=None):
@@ -30,18 +30,18 @@ def run_native_jit(args, selected, source_dir, toolchain, common, ggml):
     sys.modules[spec.name] = programs
     spec.loader.exec_module(programs)
     pack = weft.compile(getattr(programs, selected["pack"]), toolchain=toolchain,
-                        options=CompileOptions(matrix_extension="spacemit-ime1"))
+                        options=CompileOptions(matrix_extension=args.matrix_extension))
     kernel = None if args.pack_only else weft.compile(
         getattr(programs, selected["kernel"]), toolchain=toolchain,
-        options=CompileOptions(meta=selected["source"], matrix_extension="spacemit-ime1",
+        options=CompileOptions(meta=selected["source"], matrix_extension=args.matrix_extension,
                                local_tile_strategy=args.local_tile_strategy,
-                               require_extensions=("spacemit-ime1",)))
+                               require_extensions=() if args.matrix_extension == "none" else (args.matrix_extension,)))
     reference = args.output_dir / "ime1-reference.so"
     run([args.cxx, *common, "-std=c++17", "-fPIC", "-shared",
          "-I" + str(ggml / "include"), "-I" + str(ggml / "src"),
          "-I" + str(ggml / "src/ggml-cpu"), str(Path(__file__).with_name("mul_mat_runtime.cpp")),
          "-L" + str(args.ggml_lib_dir), "-Wl,-rpath," + str(args.ggml_lib_dir),
-         "-Wl,--no-as-needed", "-lggml", "-lggml-cpu", "-lggml-base", "-lgomp",
+         "-Wl,--no-as-needed", "-lggml", "-lggml-cpu", "-lggml-base",
          "-lm", "-ldl", "-pthread", "-o", str(reference)])
     library = ctypes.CDLL(str(reference.resolve()), mode=os.RTLD_LOCAL)
     pack_callback = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
@@ -110,6 +110,8 @@ def main():
     parser.add_argument("--pack-only", action="store_true")
     parser.add_argument("--execution", choices=("native-aot", "native-jit"), default="native-aot")
     parser.add_argument("--nr", type=int)
+    parser.add_argument("--matrix-extension", choices=("none", "spacemit-ime1"), default="spacemit-ime1",
+                        help="explicit compiler capability; upstream M=1 and M=4 packed kernels both use IME1")
     parser.add_argument("--local-tile-strategy",
                         choices=("target-default", "atom-partitioned", "register-grouped"),
                         default="target-default")
@@ -128,7 +130,8 @@ def main():
         selected = {**selected, "source": {**selected["source"], "NR": args.nr}}
     toolchain = Toolchain(args.compiler, (args.cc,), ("-fno-integrated-as",)).resolve()
     target = NativeTarget.discover(toolchain)
-    target.check_execution(("spacemit-ime1",))
+    required = () if args.matrix_extension == "none" else (args.matrix_extension,)
+    target.check_execution(required)
     if len(os.sched_getaffinity(0)) != 1 or target.vlen_bits != 256 or target.abi != "lp64d":
         raise RuntimeError("this comparison requires one explicitly selected IME1 core, VLEN=256 and lp64d")
 
@@ -146,15 +149,16 @@ def main():
     def compile_entry(entry, meta, require_mma):
         canonical = run([sys.executable, "-m", "weft", "lower", str(source_dir / "kernels.py"), "--kernel", entry])
         arguments = [toolchain.compiler, "--emit=artifact", f"--march={march}",
-                     "--abi=lp64d", "--vlen-bits=256", "--matrix-extension=spacemit-ime1"]
+                     "--abi=lp64d", "--vlen-bits=256", f"--matrix-extension={args.matrix_extension}"]
         arguments += [f"--meta={name}={value}" for name, value in sorted(meta.items())]
         if require_mma:
-            arguments.append("--require-extension=spacemit-ime1")
+            if required:
+                arguments.append(f"--require-extension={args.matrix_extension}")
             arguments.append(f"--local-tile-strategy={args.local_tile_strategy}")
         artifact = json.loads(run(arguments, source=canonical))
         metadata, = artifact["kernels"]
         expected_shapes = ["N", "K", "M"] if require_mma else ["N", "K"]
-        if metadata["shape_parameters"] != expected_shapes or metadata["matrix_extensions"] != ["spacemit-ime1"]:
+        if metadata["shape_parameters"] != expected_shapes or metadata["matrix_extensions"] != list(required):
             raise RuntimeError("the emitted ABI does not match the explicit repro calling convention")
         prefix = args.output_dir / entry
         prefix.with_suffix(".canonical.mlir").write_text(canonical)
@@ -173,9 +177,9 @@ def main():
          "-I" + str(ggml / "src"), "-I" + str(ggml / "src/ggml-cpu"),
          str(Path(__file__).with_name("mul_mat_runtime.cpp")),
          "-L" + str(args.ggml_lib_dir), "-Wl,-rpath," + str(args.ggml_lib_dir),
-         "-Wl,--no-as-needed", "-lggml", "-lggml-cpu", "-lggml-base", "-lgomp",
+         "-Wl,--no-as-needed", "-lggml", "-lggml-cpu", "-lggml-base",
          "-lm", "-ldl", "-pthread", "-o", str(executable)])
-    target.check_execution(("spacemit-ime1",))
+    target.check_execution(required)
     result = subprocess.run([str(executable.resolve()), args.case, str(args.repetitions), *pack, *kernel])
     if result.returncode:
         raise SystemExit(result.returncode)

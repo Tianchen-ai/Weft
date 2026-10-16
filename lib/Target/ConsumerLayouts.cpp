@@ -130,7 +130,7 @@ mlir::FailureOr<mlir::Value> convert(mlir::Value value, riscv::ValueType type,
     if (!riscv::rvvLayoutRepackSlices(before, type))
       return mlir::failure();
     edge = conversion(rewriter, "lane_repack", "pure",
-                       riscv::rvvLayoutRepackTemporaryGroups(before, type));
+                       riscv::rvvLayoutRepackTemporaryGroups(at->getParentOfType<riscv::KernelOp>().getTarget(), before, type));
   }
   rewriter.setInsertionPoint(at);
   auto result = rewriter.create<riscv::ConvertLayoutOp>(at->getLoc(), type, value,
@@ -308,8 +308,10 @@ std::optional<Work> work(riscv::KernelOp kernel) {
                repack && repack.getConversion().getKind() == "lane_repack") {
       auto slices = riscv::rvvLayoutRepackSlices(repack.getInput().getType(), repack.getResult().getType());
       if (!slices) { complete = false; return; }
-      for (auto slice : *slices)
-        count += (slice.sourceOffset != 0) + (slice.resultOffset != 0);
+      if (!riscv::isRVVSubregisterRepack(kernel.getTarget(), repack.getInput().getType(), repack.getResult().getType()) &&
+          !riscv::isRVVSubregisterRepack(kernel.getTarget(), repack.getResult().getType(), repack.getInput().getType()))
+        for (auto slice : *slices)
+          count += (slice.sourceOffset != 0) + (slice.resultOffset != 0);
     } else if (auto broadcast = mlir::dyn_cast<riscv::RVVAxisBroadcastOp>(op)) {
       auto instructions = riscv::axisBroadcastInstructionCount(broadcast.getInput().getType(),
                                                                broadcast.getResult().getType());
@@ -384,6 +386,56 @@ std::optional<riscv::LayoutAttr> completeRowHandoffLayout(
   }
   return std::nullopt;
 }
+
+void materializeRegisterRowHandoff(riscv::IMEUnpackOp unpack,
+                                   riscv::TargetAttr target,
+                                   mlir::IRRewriter &rewriter) {
+  auto result = unpack.getResult().getType();
+  auto output = result.getLayout();
+  auto natural = riscv::fragmentRVVHandoffLayout(unpack.getInput().getType(), target);
+  if (!natural || result.getShape().size() != 2 || result.getShape()[0] != 1 ||
+      natural->getLmulEighths() >= 8 || output.getLmulEighths() <= 8 ||
+      natural->getValidity() != "full" || output.getValidity() != "full" ||
+      natural->getReplicaGroup() != 1 || output.getReplicaGroup() != 1)
+    return;
+  const int64_t factor = 8 / natural->getLmulEighths();
+  auto lanes = llvm::to_vector(natural->getLaneFactors().asArrayRef());
+  auto replicas = llvm::to_vector(natural->getReplicaFactors().asArrayRef());
+  if (factor < 2 || replicas[0] != 1 || replicas[1] % factor ||
+      natural->getTimeFactors().asArrayRef() != output.getTimeFactors().asArrayRef())
+    return;
+  lanes[1] *= factor;
+  replicas[1] /= factor;
+  auto middle = riscv::LayoutAttr::get(rewriter.getContext(), "rvv", result.getAxisIds(),
+      natural->getTimeFactors(), integers(rewriter, lanes), integers(rewriter, replicas),
+      natural->getFragmentFactors(), natural->getLocalFactors(), natural->getSew(),
+      8, natural->getVl() * factor, replicas[1], "full");
+  auto sourceType = mlir::cast<riscv::ValueType>(withLayout(result, *natural));
+  auto middleType = mlir::cast<riscv::ValueType>(withLayout(result, middle));
+  if (!riscv::supportsRVVLayout(target, middle) ||
+      !riscv::rvvLayoutRepackSlices(sourceType, middleType) ||
+      !riscv::isRVVSubregisterRepack(target, result, middleType))
+    return;
+  // Form full physical registers with independent small slides, then join
+  // those registers. A serial slide into the full row moves more active lanes
+  // and makes all partial handoffs depend on the preceding one.
+  unpack.getResult().setType(sourceType);
+  const int64_t temporary = riscv::fragmentUnpackTemporaryGroups(unpack.getInput().getType(), sourceType);
+  unpack.setConversionAttr(conversion(rewriter, "fragment_to_rvv", "handoff", temporary));
+  unpack.setLeafAttr(leaf(rewriter, "ime", "fragment-unpack", "ime.unpack.rvv", "ime.unpack.rvv", 0, 0, temporary));
+  rewriter.setInsertionPointAfter(unpack);
+  auto pack = [&](mlir::Value value, riscv::ValueType type) {
+    auto edge = rewriter.create<riscv::ConvertLayoutOp>(unpack.getLoc(), type, value,
+        conversion(rewriter, "lane_repack", "pure",
+            riscv::rvvLayoutRepackTemporaryGroups(target, mlir::cast<riscv::ValueType>(value.getType()), type)),
+        riscv::AccessAttr(), unselectedLeaf(rewriter));
+    copyOrigin(unpack, edge);
+    return edge;
+  };
+  auto partial = pack(unpack.getResult(), middleType);
+  auto complete = pack(partial.getResult(), result);
+  unpack.getResult().replaceAllUsesExcept(complete.getResult(), partial);
+}
 }
 
 static mlir::LogicalResult propagateConsumerLayouts(
@@ -438,6 +490,7 @@ static mlir::LogicalResult propagateConsumerLayouts(
       if (!layout)
         continue;
       if (!rewriteComponent(anchor, *layout, rewriter)) { legal = false; break; }
+      if (completeRow) materializeRegisterRowHandoff(anchor, kernel.getTarget(), rewriter);
       changed = true;
     }
     if ((grouped || completeRow) && legal) {
@@ -446,6 +499,17 @@ static mlir::LogicalResult propagateConsumerLayouts(
         if (riscv::fragmentRVVHandoffLayout(zero.getResult().getType(), kernel.getTarget(), 2))
           zero.setLeafAttr(leaf(rewriter, "ime", "fragment-init", "ime.zero.local", "ime.zero.local",
               0, 0));
+        else if (completeRow) {
+          auto type = zero.getResult().getType();
+          const int64_t activeBits = type.getPacking().getRowsPerTile() *
+              type.getPacking().getColumnsPerTile() * logicalBitWidth(type.getElementType());
+          const int64_t lmul = activeBits * 8 / kernel.getTarget().getVlenBits();
+          if (lmul > 0 && activeBits * 8 == lmul * kernel.getTarget().getVlenBits() &&
+              lmul < riscv::fragmentPartResourceGroups(type) * 8 &&
+              llvm::is_contained(kernel.getTarget().getLegalLMULEighths().asArrayRef(), lmul))
+            zero.setLeafAttr(leaf(rewriter, "ime", "fragment-init", "ime.zero.local-prefix",
+                "ime.zero.local-prefix", 0, 0, 0, 0, "none", "exact", {lmul}));
+        }
       });
     }
     if (!legal && grouped) {

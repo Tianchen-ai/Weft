@@ -813,7 +813,7 @@ mlir::LogicalResult Emitter::compileRVVRegularRepeatScalarLoad(
   if (owner.kind != Binding::Kind::Record || owner.recordElements <= 0 ||
       !storage || !elementType || storage->bitOffset % 8 ||
       mlir::failed(sourceBase) || sourceBase->kind != Binding::Kind::Scalar ||
-      sourceCount <= 0 || repeat <= 1 || scalarParts <= 0 ||
+      sourceCount <= 0 || repeat <= 0 || scalarParts <= 0 ||
       partBases.size() != static_cast<size_t>(scalarParts))
     return fail(operation,
                 "regular-repeat scalar load has incomplete typed storage geometry");
@@ -900,19 +900,25 @@ Emitter::compileRVVLayeredStream(riscv::RVVLayeredStreamOp operation) {
     if (!coordinates || coordinates->size() != axes.size())
       return fail(operation,
                   "RVV layered stream has no register-coordinate mapping");
-    std::string record = "(" + owner.recordPointer;
+    Binding record = owner;
+    std::string pointer = "(" + owner.recordPointer;
+    std::string rowOffset = "0";
     for (auto [axis, coordinate] : llvm::zip(axes, *coordinates)) {
+      if (owner.interleaveRows > 0 && axis == owner.interleaveRowAxis) {
+        rowOffset = std::to_string(coordinate);
+        continue;
+      }
       bool foundStride = false;
       for (const auto &[recordAxis, stride] : owner.recordByteStrides)
         if (recordAxis == axis) {
-          record += " + " + std::to_string(coordinate) + " * " + stride;
+          pointer += " + " + std::to_string(coordinate) + " * " + stride;
           foundStride = true;
         }
       if (!foundStride)
         return fail(operation,
                     "RVV layered stream register axis has no record-byte stride");
     }
-    record += ")";
+    record.recordPointer = pointer + ")";
     llvm::SmallVector<std::string> loadedWindows;
     loadedWindows.reserve(geometry.getRepresentativeStreamForWindow().size());
     for (auto [window, firstStream] :
@@ -925,10 +931,11 @@ Emitter::compileRVVLayeredStream(riscv::RVVLayeredStreamOp operation) {
           field->bitOffset / 8 + geometry.getGroupForWindow()[window] * layer +
           geometry.getWithinForWindow()[window];
       const int64_t part = replica * streams + firstStream;
+      const std::string address = fieldStorageAddress(
+          record, *field, std::to_string(byteOffset), rowOffset);
       std::string raw = fresh("layered_stream_raw");
       line(type + " " + raw + " = __riscv_vle8_v_" + suffix +
-           "((const uint8_t *)(" + record + " + " +
-           std::to_string(byteOffset) + "), " +
+           "((const uint8_t *)(" + address + "), " +
            partVL(operation.getResult(), part) + ");");
       loadedWindows.push_back(std::move(raw));
     }
@@ -1422,7 +1429,7 @@ mlir::LogicalResult Emitter::compileRVVContractStep(
     if (active.kind != Binding::Kind::Scalar)
       return fail(operation, "contract step lost its explicit active length");
   }
-  const std::string intrinsic = geometry->widening ? "vfwmacc_vf_" :
+  const std::string intrinsic = geometry->widening ? (geometry->floating ? "vfwmacc_vf_" : "vwmacc_vx_") :
       (geometry->floating ? "vfmacc_vf_" : "vmacc_vx_");
   for (size_t part = 0; part < accumulator.parts.size(); ++part) {
     const int64_t lanePart = geometry->laneParts[part];

@@ -1,10 +1,12 @@
 #include "Weft/Target/RISCVPasses.h"
+#include "Weft/Dialect/RISCV/IR/Fragment.h"
 #include "PipelineSchedule.h"
 #include "PipelineShapeBindings.h"
 #include "RISCVPhysicalSupport.h"
 #include "ValueLiveness.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/SetVector.h"
 
 using namespace mlir;
 using namespace weft;
@@ -107,8 +109,146 @@ private:
   Statistic interleavedLoops{this, "interleaved-loops", "Pipelines with a smaller expanded region register peak"};
   Statistic maximumReduction{this, "maximum-register-reduction", "Largest reduction in expanded region register groups"};
 };
+
+// Move an independent epilogue supply ahead of the contraction it will join.
+// This is same-block scheduling: no iteration, Level or numerical boundary is
+// changed. Keep the selected layouts/leaves and check their complete live set.
+class ScheduleRISCVLocalSuppliesPass
+    : public PassWrapper<ScheduleRISCVLocalSuppliesPass, OperationPass<ModuleOp>> {
+  static bool collectRead(Value value, Operation *anchor,
+                          llvm::SetVector<Operation *> &operations) {
+    auto *op = value.getDefiningOp();
+    if (!op || op->getBlock() != anchor->getBlock() || op->isBeforeInBlock(anchor))
+      return true;
+    if (operations.contains(op)) return true;
+    if (operations.size() >= 24 || op == anchor || op->getNumRegions() ||
+        op->hasAttr("birth_id") ||
+        !(isa<riscv::IMEFragmentStorageLoadOp, riscv::PhysicalPointOp,
+              riscv::FieldOp, riscv::ExtractOp, riscv::CastOp, riscv::WidenOp>(op) ||
+          op->getName().getDialectNamespace() == "arith") ||
+        !riscv::hasOnlyReadEffects(op))
+      return false;
+    for (Value operand : op->getOperands())
+      if (!collectRead(operand, anchor, operations)) return false;
+    operations.insert(op);
+    return true;
+  }
+
+  static unsigned scheduleReads(ModuleOp module) {
+    SmallVector<riscv::IMEFragmentStorageLoadOp> reads;
+    module.walk([&](riscv::IMEFragmentStorageLoadOp op) { reads.push_back(op); });
+    unsigned selected = 0;
+    for (auto read : reads) {
+      auto kernel = read->getParentOfType<riscv::KernelOp>();
+      if (!kernel || kernel.getResourcesMaterialized() ||
+          riscv::fragmentPartCount(read.getResult().getType()) < 2)
+        continue;
+      riscv::IMEFragmentMMAOp anchor;
+      for (Operation *op = read->getPrevNode(); op; op = op->getPrevNode()) {
+        if (auto mma = dyn_cast<riscv::IMEFragmentMMAOp>(op)) {
+          if (!mma.getMemoryClobber()) anchor = mma;
+          break;
+        }
+        if (!riscv::hasOnlyReadEffects(op)) break;
+      }
+      if (!anchor) continue;
+      llvm::SetVector<Operation *> closure;
+      if (!collectRead(read.getResult(), anchor, closure)) continue;
+      SmallVector<std::pair<Operation *, Operation *>> positions;
+      for (Operation *op : closure) {
+        positions.emplace_back(op, op->getNextNode());
+        op->moveBefore(anchor);
+      }
+      auto pressure = physicalRegisterPressure(kernel);
+      if (!pressure || pressure->total() > kernel.getTarget().getVectorRegisters()) {
+        for (auto [op, next] : llvm::reverse(positions)) op->moveBefore(next);
+        continue;
+      }
+      ++selected;
+    }
+    return selected;
+  }
+
+  static riscv::IMEUnpackOp fragmentResult(Value value) {
+    for (unsigned depth = 0; depth < 8; ++depth) {
+      auto *op = value.getDefiningOp();
+      if (auto unpack = dyn_cast_or_null<riscv::IMEUnpackOp>(op)) return unpack;
+      if (!isa_and_nonnull<riscv::WidenOp, riscv::CastOp, riscv::ConvertLayoutOp>(op)) return {};
+      value = op->getOperand(0);
+    }
+    return {};
+  }
+
+  static bool collect(Value value, Operation *anchor, llvm::SetVector<Operation *> &operations) {
+    auto *op = value.getDefiningOp();
+    if (!op || op->getBlock() != anchor->getBlock() || op->isBeforeInBlock(anchor)) return true;
+    if (operations.contains(op)) return true;
+    if (operations.size() >= 24 || op == anchor || op->getNumRegions() ||
+        !isa<riscv::FieldOp, riscv::FieldReadOp, riscv::WidenOp, riscv::CastOp,
+             riscv::BinaryOp, riscv::ConvertLayoutOp>(op) || !riscv::hasOnlyReadEffects(op)) return false;
+    if (auto binary = dyn_cast<riscv::BinaryOp>(op); binary && binary.getKind() != "mul") return false;
+    for (Value operand : op->getOperands())
+      if (!collect(operand, anchor, operations)) return false;
+    operations.insert(op);
+    return true;
+  }
+
+public:
+  StringRef getArgument() const override { return "weft-riscv-schedule-local-supplies"; }
+  StringRef getDescription() const override {
+    return "Overlap independent same-block numeric supplies with selected contractions";
+  }
+  void runOnOperation() override {
+    SmallVector<riscv::BinaryOp> consumers;
+    getOperation().walk([&](riscv::BinaryOp op) {
+      if (op.getKind() == "mul") consumers.push_back(op);
+    });
+    unsigned selected = 0;
+    for (auto consumer : consumers) {
+      auto kernel = consumer->getParentOfType<riscv::KernelOp>();
+      if (!kernel || kernel.getResourcesMaterialized()) continue;
+      auto unpack = fragmentResult(consumer.getLhs());
+      Value supply = consumer.getRhs();
+      if (!unpack) { unpack = fragmentResult(consumer.getRhs()); supply = consumer.getLhs(); }
+      if (!unpack || unpack->getBlock() != consumer->getBlock()) continue;
+      auto first = unpack.getInput().getDefiningOp<riscv::IMEFragmentMMAOp>();
+      if (!first || first->getBlock() != consumer->getBlock()) continue;
+      while (auto prior = first.getAccumulator().getDefiningOp<riscv::IMEFragmentMMAOp>()) {
+        if (prior->getBlock() != consumer->getBlock()) break;
+        first = prior;
+      }
+      llvm::SetVector<Operation *> closure;
+      if (!collect(supply, first, closure) || closure.empty()) continue;
+      bool legal = true;
+      for (Operation *op = first; op != consumer; op = op->getNextNode()) {
+        if (auto mma = dyn_cast<riscv::IMEFragmentMMAOp>(op)) legal &= !mma.getMemoryClobber();
+        else legal &= riscv::hasOnlyReadEffects(op);
+      }
+      if (!legal) continue;
+      SmallVector<std::pair<Operation *, Operation *>> positions;
+      for (Operation *op : closure) {
+        positions.emplace_back(op, op->getNextNode());
+        op->moveBefore(first);
+      }
+      auto pressure = physicalRegisterPressure(kernel);
+      if (!pressure || pressure->total() > kernel.getTarget().getVectorRegisters()) {
+        for (auto [op, next] : llvm::reverse(positions)) op->moveBefore(next);
+        continue;
+      }
+      ++selected;
+    }
+    const auto reads = scheduleReads(getOperation());
+    if (selected || reads)
+      llvm::errs() << "weft-local-supply-schedule: selected=" << selected
+                   << " reads=" << reads << '\n';
+  }
+};
 } // namespace
 
 std::unique_ptr<Pass> weft::createScheduleRISCVLevelsPass() {
   return std::make_unique<ScheduleRISCVLevelsPass>();
+}
+
+std::unique_ptr<Pass> weft::createScheduleRISCVLocalSuppliesPass() {
+  return std::make_unique<ScheduleRISCVLocalSuppliesPass>();
 }

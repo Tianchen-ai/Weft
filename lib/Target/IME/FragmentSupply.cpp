@@ -94,29 +94,33 @@ void weft::riscv_internal::materializeFragmentRowSupply(
           definition && definition->getBlock() == operation->getBlock())
         rewriter.setInsertionPointAfter(definition);
       const int64_t parts = riscv::fragmentPartCount(fragment);
-      auto target = kernel.getTarget();
-      auto layout = input.getLayout();
-      auto packing = fragment.getPacking();
-      const auto *capability = findRISCVFragmentCapability(fragment.getFamily());
-      const bool byteRepeat = capability && capability->activeMFactor == capability->mFactor &&
-          packing.getElementOrder() == "row_major" && packing.getTileOrder() == "row_major" &&
-          fragment.getLayout().getReplicaFactors()[packing.getAxisOrder()[1]] == 1 &&
-          layout.getLaneFactors()[0] == packing.getRowsPerTile() * parts &&
-          packing.getRowsPerTile() * 64 == target.getVlenBits() &&
-          layout.getLmulEighths() == parts && layout.getVl() * 64 == target.getVlenBits() * parts &&
-          llvm::is_contained(target.getSupportedSEW().asArrayRef(), 64) &&
-          llvm::is_contained(target.getLegalLMULEighths().asArrayRef(), 8 * parts);
-      auto instruction = byteRepeat ? "ime.rows.byte-repeat" : "ime.rows.local";
+      const bool byteRepeat = parts == 1 &&
+          riscv::supportsFragmentByteRepeat(fragment, input, kernel.getTarget());
+      const bool partialRows = llvm::any_of(kernel.getTarget().getFragments(),
+          [&](mlir::Attribute attribute) {
+            auto capability = mlir::cast<riscv::FragmentCapabilityAttr>(attribute);
+            return capability.getInstruction() == fragment.getFamily() &&
+                capability.getActiveMFactor() < capability.getMFactor();
+          });
+      // Full-row accumulators leave little room for invariant gather indices.
+      // Keep those indices inside the local issue instead of extending their
+      // lifetime across the contraction's wider floating epilogue.
+      const bool preparedIndices = !byteRepeat && parts > 1 && parts <= 4 && partialRows;
+      auto instruction = byteRepeat ? "ime.rows.byte-repeat" :
+                         preparedIndices ? "ime.rows.indices" : "ime.rows.local";
       auto supply = rewriter.create<riscv::IMEFragmentRowBroadcastOp>(operation.getLoc(),
           fragment, operation.getRhs(), leaf(rewriter, "ime", "fragment-broadcast",
-              instruction, instruction, 0, 0, byteRepeat ? 2 * parts : parts + 1));
+              instruction, instruction, 0, 0,
+              byteRepeat || preparedIndices ? 2 * parts : parts + 1));
       copyOrigin(operation, supply);
       broadcast = supply.getResult();
       prior.push_back(broadcast);
     }
     operation.getRhsMutable().assign(broadcast);
+    const bool grouped = riscv::supportsFragmentGroupedLoad(fragment, kernel.getTarget());
+    auto instruction = ("ime.fragment." + operation.getKind()).str() + (grouped ? ".grouped" : "");
     operation.setLeafAttr(leaf(rewriter, "ime", "fragment-pointwise",
-        ("ime.fragment." + operation.getKind()).str(), ("ime.fragment." + operation.getKind()).str(),
+        instruction, instruction,
         0, 0, 0, fragment.getResourceGroups()));
   });
 }
@@ -219,7 +223,8 @@ mlir::LogicalResult weft::riscv_internal::shareFragmentStorage(
     auto lower = constantIndex(loop.getLowerBound());
     auto upper = constantIndex(loop.getUpperBound());
     auto step = constantIndex(loop.getStep());
-    if (!lower || !upper || !step || *lower != 0 || *step != 1 || *upper < 2 || *upper > 4)
+    if (!lower || !upper || !step || *lower < 0 || *step != 1 ||
+        *upper <= *lower || *upper - *lower < 2 || *upper - *lower > 4)
       return;
     for (auto read : loop.getBody()->getOps<riscv::IMEFragmentStorageLoadOp>()) {
       auto candidate = supply(read);
@@ -227,7 +232,10 @@ mlir::LogicalResult weft::riscv_internal::shareFragmentStorage(
         continue;
       const int64_t layers = read.getAccess().getGroupSize() / read.getAccess().getLayerSize();
       auto base = candidate->point.getBase().getDefiningOp<mlir::arith::AddIOp>();
-      if (!base || *upper % layers || layers > 4 ||
+      // A peeled pipeline may begin partway through a group. Unroll only
+      // when this bounded interval still contains a complete shared window.
+      if (!base || layers <= 0 || layers > 4 ||
+          *upper / layers - (*lower / layers + (*lower % layers != 0)) < 1 ||
           base.getLhs() != candidate->parent.getBase())
         continue;
       auto offset = base.getRhs().getDefiningOp<mlir::arith::MulIOp>();
@@ -239,7 +247,8 @@ mlir::LogicalResult weft::riscv_internal::shareFragmentStorage(
     }
   });
   for (auto loop : issues) {
-    auto unrolled = mlir::loopUnrollByFactor(loop, *constantIndex(loop.getUpperBound()));
+    auto unrolled = mlir::loopUnrollByFactor(loop,
+        *constantIndex(loop.getUpperBound()) - *constantIndex(loop.getLowerBound()));
     if (mlir::failed(unrolled))
       return loop.emitError("bounded packed-layer issue group could not be materialized");
   }

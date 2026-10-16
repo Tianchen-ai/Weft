@@ -415,6 +415,10 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
     return compileRVVTileContract(step);
   if (auto issue = mlir::dyn_cast<riscv::RVVFMAIssueOp>(operation))
     return compileRVVFMAIssue(issue);
+  if (auto mac = mlir::dyn_cast<riscv::RVVIntegerMACOp>(operation))
+    return compileRVVIntegerMAC(mac);
+  if (auto fma = mlir::dyn_cast<riscv::FMAOp>(operation))
+    return compileFMA(fma);
   if (auto step = mlir::dyn_cast<riscv::RVVStreamReduceStepOp>(operation))
     return compileRVVStreamReduceStep(step);
   if (auto step = mlir::dyn_cast<riscv::RVVStreamContractStepOp>(operation))

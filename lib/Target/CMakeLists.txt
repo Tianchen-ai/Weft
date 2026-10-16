@@ -21,6 +21,7 @@ add_library(WeftRISCVTarget STATIC
   SpecializeRISCVMemory.cpp
   SelectRISCVDenseTransfers.cpp
   SelectRISCVFMAIssues.cpp
+  ContractRISCVFloatingPoint.cpp
   SelectRISCVScalarPackets.cpp
   SimplifyRISCVControl.cpp
   PlanRISCVFieldStores.cpp
@@ -57,6 +58,7 @@ add_library(WeftRISCVTarget STATIC
   FinalizeRISCVLeaves.cpp
   PredicateRegisters.cpp
   SelectRISCVScalarLoadPrimes.cpp
+  ContractRISCVIntegerPointwise.cpp
   MaterializeRISCVReadSnapshots.cpp
   MaterializeRISCVResources.cpp
   FuseRISCVPhysicalIssueLoops.cpp

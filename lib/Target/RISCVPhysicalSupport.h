@@ -171,6 +171,7 @@ analyzeIndexedEntryRelation(mlir::Value fullIndices, riscv::ValueType result,
                             llvm::ArrayRef<int64_t> retainedShape);
 std::optional<RegularIndexRelation>
 analyzeRegularIndexRelation(mlir::Value value, unsigned depth = 0);
+std::optional<int64_t> constantContiguousIndexBase(mlir::Value value, unsigned depth = 0);
 std::string printType(mlir::Type type);
 
 riscv::EncodingDeclOp findEncoding(mlir::Operation *operation,

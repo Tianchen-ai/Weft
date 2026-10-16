@@ -180,12 +180,12 @@ class Artifact:
 
         if self.manifest["native_library"]:
             return self
-        selected = (Toolchain.from_environment() if toolchain is None else toolchain).resolve()
+        selected = (Toolchain.from_environment() if toolchain is None else toolchain).resolve_linker()
         selected_cache = cache if isinstance(cache, ArtifactCache) else ArtifactCache(cache)
         original = json.loads((self.path / "manifest.json").read_text())
         identity = {"operation": "link-artifact", "manifest": original,
                     "source": self.source, "dispatch": (self.path / "dispatch.c").read_text(), "canonical": self.canonical_ir,
-                    "physical": self.riscv_ir, "toolchain": selected.identity(native_library=True),
+                    "physical": self.riscv_ir, "toolchain": selected.link_identity(),
                     "runtime": [file_identity(path) for path in sorted(Path(__file__).parent.glob("*.py"))]}
 
         def build(staging: Path) -> None:

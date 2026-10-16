@@ -155,6 +155,55 @@ bool weft::riscv::legalFMAIssueGroups(const FMAIssueGeometry &geometry,
   return !ends.empty() && begin == geometry.parts();
 }
 
+StringRef weft::riscv::pointwiseFMAInstruction(Type lhs, Type rhs, Type result) {
+  if (result.isF32() || result.isF64())
+    return lhs == result && rhs == result ? "scalar.fma" : "";
+  auto value = dyn_cast<ValueType>(result);
+  if (!value || (!value.getElementType().isF32() && !value.getElementType().isF64()) ||
+      value.getLayout().getCarrier() != "rvv" ||
+      (value.getLayout().getValidity() != "full" && value.getLayout().getValidity() != "tail") || lhs != result)
+    return "";
+  if (rhs == result) return "rvv.vfmacc.vv";
+  return rhs == value.getElementType() ? "rvv.vfmacc.vf" : "";
+}
+
+LogicalResult RVVIntegerMACOp::verify() {
+  auto type = getResult().getType();
+  auto element = dyn_cast<IntegerType>(type.getElementType());
+  auto kernel = (*this)->getParentOfType<KernelOp>();
+  auto layout = type.getLayout();
+  if (!kernel || !element || element.isSignless() || element.getWidth() < 8 ||
+      getVector().getType() != type || getAccumulator().getType() != type ||
+      getMultiplier().getType() != element || layout.getCarrier() != "rvv" ||
+      layout.getSew() != element.getWidth() ||
+      (layout.getValidity() != "full" && layout.getValidity() != "tail") ||
+      !supportsRVVLayout(kernel.getTarget(), layout))
+    return emitOpError("integer MAC requires equal-width modular arithmetic and matching RVV carriers");
+  auto leaf = getLeaf();
+  if (!detail::exactLeaf(leaf, "rvv", "integer-mac", "rvv.vmacc.vx", "none", "exact") ||
+      leaf.getTemporaryGroups() || leaf.getFragmentGroups() || leaf.getLocalBytes() ||
+      !leaf.getParameters().empty())
+    return emitOpError("integer MAC requires its exact scalar-multiplier leaf");
+  return success();
+}
+
+LogicalResult FMAOp::verify() {
+  auto instruction = pointwiseFMAInstruction(getLhs().getType(), getRhs().getType(),
+                                            getResult().getType());
+  auto kernel = (*this)->getParentOfType<KernelOp>();
+  if (!kernel || instruction.empty() || getAccumulator().getType() != getResult().getType())
+    return emitOpError("pointwise FMA requires equal floating precision and a closed scalar or RVV carrier");
+  auto value = dyn_cast<ValueType>(getResult().getType());
+  if (value && !supportsRVVLayout(kernel.getTarget(), value.getLayout()))
+    return emitOpError("pointwise FMA has an unsupported SEW/LMUL carrier");
+  auto leaf = getLeaf();
+  if (!detail::exactLeaf(leaf, value ? "rvv" : "scalar", "fma", instruction, "none", value ? "exact" : "agnostic") ||
+      leaf.getTemporaryGroups() || leaf.getFragmentGroups() || leaf.getLocalBytes() ||
+      !leaf.getParameters().empty())
+    return emitOpError("pointwise FMA requires its exact numeric leaf without hidden work");
+  return success();
+}
+
 LogicalResult RVVFMAIssueOp::verify() {
   auto kernel = (*this)->getParentOfType<KernelOp>();
   auto type = getResult().getType();

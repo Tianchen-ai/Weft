@@ -15,8 +15,8 @@
 
 namespace ime1_repro {
 
-constexpr std::size_t kN = 4096;
-constexpr std::size_t kK = 4096;
+inline std::size_t kN = 4096;
+inline std::size_t kK = 4096;
 constexpr std::size_t kFlushBytes = 64U * 1024U * 1024U;
 constexpr double kAbsoluteTolerance = 1.0e-4;
 constexpr double kRelativeTolerance = 2.0e-3;

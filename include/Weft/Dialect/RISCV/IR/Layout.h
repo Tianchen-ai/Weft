@@ -65,7 +65,8 @@ std::optional<llvm::SmallVector<int64_t>> rvvLaneCoordinates(
 // No numerical permutation, memory access, or implicit layout choice occurs.
 std::optional<llvm::SmallVector<RVVLayoutSlice>>
 rvvLayoutRepackSlices(ValueType input, ValueType result);
-int64_t rvvLayoutRepackTemporaryGroups(ValueType input, ValueType result);
+bool isRVVSubregisterRepack(TargetAttr target, ValueType input, ValueType result);
+int64_t rvvLayoutRepackTemporaryGroups(TargetAttr target, ValueType input, ValueType result);
 std::optional<LayoutAttr> fragmentRVVHandoffLayout(FragmentType input,
                                                   TargetAttr target,
                                                   int64_t replicaGroup = 1);
@@ -87,6 +88,8 @@ std::optional<int64_t> rvvRowScaleRows(BinaryOp operation);
 std::optional<int64_t> rvvRowScaleTemporaryGroups(BinaryOp operation);
 mlir::Value registerAliasSource(mlir::Value value);
 std::optional<llvm::SmallVector<int64_t>> scalarExtractParts(ExtractOp operation);
+std::optional<llvm::SmallVector<int64_t>> rvvRegularGatherIndices(
+    ValueType input, ValueType result, llvm::ArrayRef<int64_t> pattern);
 bool hasUniqueRegisterUse(mlir::Value value);
 } // namespace weft::riscv
 

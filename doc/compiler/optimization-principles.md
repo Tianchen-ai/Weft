@@ -240,6 +240,10 @@ versions、prologue/epilogue占比、spill变化。只看到`pipeline_depth=2`�
 SSA version与prologue/steady/epilogue展开。只实现distance=1、depth=2/buffer=2；没有typed
 transfer和latency事实时，prefetch保持不存在，而不是设一个非零默认值。
 
+同一 block 内，`ScheduleRISCVLocalSupplies` 可把多 atom 的 fragment raw read 及其纯地址依赖
+移到紧邻的前一条 MMA 之前。它不跨写入、未知 effect、memory-clobber 或 birth，最多跨一次
+MMA，并在改写后检查完整 kernel 的寄存器驻留；不能把此局部重排解释为跨 iteration 流水。
+
 同一raw window上的scalar-prime leaf不构成上述prefetch：它没有future-iteration、distance、
 buffer version或新增SSA，只是一个由完整memory edge和实测parameter共同选择的固定局部序列。
 

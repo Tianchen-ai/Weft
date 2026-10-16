@@ -560,6 +560,57 @@ void packAdjacentScaleCombines(mlir::ModuleOp module,
   }
 }
 
+void shortenReducedScaleChains(mlir::ModuleOp module,
+                               mlir::IRRewriter &rewriter) {
+  llvm::SmallVector<riscv::RVVPartialScaleCombineOp> combines;
+  module.walk([&](riscv::RVVPartialScaleCombineOp op) { combines.push_back(op); });
+  unsigned selected = 0;
+  for (auto combine : combines) {
+    auto kernel = combine->getParentOfType<riscv::KernelOp>();
+    auto input = combine.getInput().getType();
+    auto result = combine.getResult().getType();
+    auto partial = input.getPartialType();
+    auto layout = partial.getLayout();
+    auto element = mlir::dyn_cast<mlir::IntegerType>(partial.getElementType());
+    const int64_t slots = input.getSlots();
+    if (!kernel || kernel.getResourcesMaterialized() || result.getSlots() != 1 ||
+        slots < 4 || slots > 8 || slots % 2 ||
+        !element || !element.isSigned() || element.getWidth() != 32 ||
+        partial.getShape().asArrayRef() != llvm::ArrayRef<int64_t>({1}) ||
+        layout.getCarrier() != "rvv" || layout.getVl() != 1 ||
+        layout.getValidity() != "full" || layout.getRegisterGroups() != 1 ||
+        input.getResourceGroups() + 3 > kernel.getTarget().getVectorRegisters())
+      continue;
+    // Keep every weight attached to its completed i32 partial. Two independent
+    // chains shorten the MAC dependency by half, at the cost of one extra issue
+    // and one extra live result. The following add stays in the same i32 domain.
+    auto split = riscv::PartialSetType::get(
+        rewriter.getContext(), partial, input.getReductionAxis(), 2,
+        result.getTermsPerSlot() / 2, 2);
+    rewriter.setInsertionPoint(combine);
+    auto chains = rewriter.create<riscv::RVVPartialScaleCombineOp>(
+        combine.getLoc(), split, combine.getInput(), combine.getScales(),
+        combine.getScaleReplicasAttr(), combine.getSlotOrderAttr(),
+        combine.getLogicalReductionAxesAttr(),
+        riscv_internal::leaf(rewriter, "rvv", "partial-scale-combine",
+            "rvv.partial-scale-combine", "rvv.partial-scale-combine",
+            input.getResourceGroups(), 2, 1, 0, "none", "exact",
+            {input.getReductionAxis(), slots, 2, slots / 2}));
+    auto joined = rewriter.create<riscv::RVVPartialCombineOp>(
+        combine.getLoc(), result, chains.getResult(), 2, "pairwise",
+        combine.getLogicalReductionAxesAttr(),
+        riscv_internal::leaf(rewriter, "rvv", "partial-combine",
+            "rvv.partial-combine", "rvv.partial-combine", 2, 1, 0, 0,
+            "none", "exact", {input.getReductionAxis(), 2, 1}));
+    riscv_internal::copyOrigin(combine, chains);
+    riscv_internal::copyOrigin(combine, joined);
+    rewriter.replaceOp(combine, joined.getResult());
+    ++selected;
+  }
+  if (selected)
+    llvm::errs() << "weft-scaled-partial-chains: split=" << selected << '\n';
+}
+
 class CoalesceRISCVPartialExtractionsPass
     : public mlir::PassWrapper<CoalesceRISCVPartialExtractionsPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -581,6 +632,7 @@ public:
     }
     packReducedScaleCombines(getOperation(), rewriter);
     packAdjacentScaleCombines(getOperation(), rewriter);
+    shortenReducedScaleChains(getOperation(), rewriter);
   }
 };
 

@@ -53,6 +53,12 @@ Level 不能在canonical化时退化成“一个loop加几个可丢弃attribute�
 - operation精度、顺序、overflow/wrap/saturate语义；
 - reduce identity、空域政策、NaN/signed-zero与允许的结合自由度。
 
+同一局部作用域内，浮点乘法的结果若仅被一次同精度加法消费，允许目标将该直接
+`mul + add` 对 contraction 成一次 FMA。它使用一次舍入，仍按声明的浮点容差验收；
+不授权重结合 scale tree、改变 reduction 顺序，也不跨显式 cast/widen/narrow、Level
+或其它可观察数值边界。Canonical IR 继续保存原始两条 operation，Physical pass
+根据这项数值许可形成显式 FMA，而不是由 terminal 匹配表达式。
+
 ## 2. 按设计不承载的内容
 
 Canonical Kernel IR 不包含：

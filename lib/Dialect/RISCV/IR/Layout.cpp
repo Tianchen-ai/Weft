@@ -6,6 +6,39 @@
 
 using namespace weft::riscv;
 
+std::optional<llvm::SmallVector<int64_t>> weft::riscv::rvvRegularGatherIndices(
+    ValueType input, ValueType result, llvm::ArrayRef<int64_t> pattern) {
+  if (!input || !result || pattern.size() != 3 || pattern[0] < 0 ||
+      pattern[1] <= 0 || pattern[2] <= 0 || input.getShape().size() != 1 ||
+      result.getShape().size() != 1 || input.getAxisIds() != result.getAxisIds() ||
+      input.getElementType() != result.getElementType() ||
+      result.getShape()[0] <= 0 || result.getShape()[0] > 4096)
+    return std::nullopt;
+  auto source = input.getLayout(), destination = result.getLayout();
+  auto from = RegisterCoordinates::get(source), to = RegisterCoordinates::get(destination);
+  if (!from || !to || from->parts() != 1 ||
+      from->lanes() != input.getShape()[0] ||
+      source.getCarrier() != "rvv" || destination.getCarrier() != "rvv" ||
+      source.getValidity() != "full" || destination.getValidity() != "full" ||
+      source.getSew() != destination.getSew() ||
+      source.getLmulEighths() != destination.getLmulEighths() ||
+      source.getReplicaGroup() != 1 || destination.getReplicaGroup() != 1 ||
+      to->extents()[0] != result.getShape()[0])
+    return std::nullopt;
+  llvm::SmallVector<int64_t> indices;
+  for (int64_t part = 0; part < to->parts(); ++part) {
+    auto first = to->logical(part, 0), last = to->logical(part, to->lanes() - 1);
+    if (!first || !last || (*first)[0] / pattern[2] != (*last)[0] / pattern[2])
+      return std::nullopt;
+    const __int128 index = pattern[0] +
+        static_cast<__int128>((*first)[0] / pattern[2]) * pattern[1];
+    if (index < 0 || index >= input.getShape()[0])
+      return std::nullopt;
+    indices.push_back(static_cast<int64_t>(index));
+  }
+  return indices;
+}
+
 std::optional<llvm::SmallVector<int64_t>> weft::riscv::scalarExtractParts(ExtractOp op) {
   auto input = op.getInput().getType();
   auto output = mlir::dyn_cast<ValueType>(op.getResult().getType());
@@ -192,9 +225,28 @@ weft::riscv::rvvLayoutRepackSlices(ValueType input, ValueType result) {
   return slices;
 }
 
-int64_t weft::riscv::rvvLayoutRepackTemporaryGroups(ValueType input, ValueType result) {
+bool weft::riscv::isRVVSubregisterRepack(TargetAttr target, ValueType input, ValueType result) {
+  auto a = input.getLayout(), b = result.getLayout();
+  if (!target || a.getLmulEighths() <= b.getLmulEighths() || b.getLmulEighths() < 8 ||
+      a.getValidity() != "full" || b.getValidity() != "full")
+    return false;
+  auto source = RegisterCoordinates::get(a), destination = RegisterCoordinates::get(b);
+  const int64_t capacity = target.getVlenBits() * b.getLmulEighths() / (8 * b.getSew());
+  auto slices = rvvLayoutRepackSlices(input, result);
+  if (!source || !destination || !slices || capacity <= 0 || destination->lanes() != capacity ||
+      source->lanes() != target.getVlenBits() * a.getLmulEighths() / (8 * a.getSew()) ||
+      slices->size() != static_cast<size_t>(destination->parts()))
+    return false;
+  return llvm::all_of(*slices, [&](const RVVLayoutSlice &slice) {
+    return slice.resultOffset == 0 && slice.count == capacity && slice.sourceOffset % capacity == 0;
+  });
+}
+
+int64_t weft::riscv::rvvLayoutRepackTemporaryGroups(TargetAttr target, ValueType input, ValueType result) {
   auto a = input.getLayout(), b = result.getLayout();
   auto streams = boundedProduct(b.getTimeFactors());
+  if (isRVVSubregisterRepack(target, input, result) || isRVVSubregisterRepack(target, result, input))
+    return streams ? *streams * b.getRegisterGroups() : -1;
   return streams ? *streams * b.getRegisterGroups() +
                        (std::max(a.getLmulEighths(), b.getLmulEighths()) + 7) / 8
                  : -1;

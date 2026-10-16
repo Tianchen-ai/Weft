@@ -23,11 +23,13 @@ mlir::LogicalResult Emitter::compileIMEZero(riscv::IMEZeroOp operation) {
     return fail(operation, "fragment zero has no selected register carrier");
   const int64_t bits = riscv_internal::logicalBitWidth(fragment.getElementType());
   const int64_t groups = riscv::fragmentPartResourceGroups(fragment);
-  const int64_t elements = kernel.getTarget().getVlenBits() * groups / bits;
+  const int64_t elements = fragment.getPacking().getRowsPerTile() *
+                           fragment.getPacking().getColumnsPerTile();
   Binding result;
   result.kind = Binding::Kind::Fragment;
   result.fragmentFamily = fragment.getFamily().str();
-  const bool local = operation.getLeaf().getInstruction() == "ime.zero.local";
+  const bool prefix = operation.getLeaf().getInstruction() == "ime.zero.local-prefix";
+  const bool local = prefix || operation.getLeaf().getInstruction() == "ime.zero.local";
   if (!local && operation.getLeaf().getInstruction() != "ime.zero")
     return fail(operation, "fragment zero has no exact selected local realization");
   if (local) {
@@ -36,7 +38,9 @@ mlir::LogicalResult Emitter::compileIMEZero(riscv::IMEZeroOp operation) {
       line(*type + " " + result.parts.back() + ";");
     }
     line("__asm__ volatile(");
-    line("  \"vsetvli zero, %[vl], e" + std::to_string(bits) + ", m" + std::to_string(groups) + ", ta, ma\\n\\t\"");
+    const std::string lmul = prefix ? lmulSpelling(operation.getLeaf().getParameters()[0])
+                                    : "m" + std::to_string(groups);
+    line("  \"vsetvli zero, %[vl], e" + std::to_string(bits) + ", " + lmul + ", ta, ma\\n\\t\"");
     std::string outputs = "  : ";
     for (auto [part, name] : llvm::enumerate(result.parts)) {
       line("  \"vmv.v.i %[part" + std::to_string(part) + "], 0\\n\\t\"");
@@ -44,7 +48,7 @@ mlir::LogicalResult Emitter::compileIMEZero(riscv::IMEZeroOp operation) {
       outputs += "[part" + std::to_string(part) + "] \"=vr\"(" + name + ")";
     }
     line(outputs);
-    line("  : [vl] \"r\"((size_t)" + std::to_string(elements) + "));");
+    line("  : [vl] \"r\"((size_t)" + std::to_string(elements) + ") : \"vl\", \"vtype\");");
     bindings[operation.getResult()] = std::move(result);
     return mlir::success();
   }
@@ -134,9 +138,34 @@ mlir::LogicalResult Emitter::compileIMEFragmentStorageLoad(riscv::IMEFragmentSto
     return fail(operation, "fragment field load has no closed byte projection");
   auto fragment = operation.getResult().getType();
   const int64_t cells = fragment.getPacking().getRowsPerTile() * fragment.getPacking().getColumnsPerTile();
+  const auto instruction = operation.getLeaf().getInstruction();
+  const bool grouped = instruction == "ime.field-raw-load.grouped" ||
+                       instruction == "ime.field-raw-load.grouped.scalar-prime";
+  if (instruction == "ime.field-raw-load.scalar-prime" ||
+      instruction == "ime.field-raw-load.grouped.scalar-prime") {
+    const int64_t finalByte = cells * riscv::fragmentPartCount(fragment) - 1;
+    line("__asm__ volatile(\"lb zero, " + std::to_string(finalByte) +
+         "(%0)\" : : \"r\"((const uint8_t *)" +
+         fieldStorageAddress(owner, *field, storage->byte) + ") : \"memory\");");
+  }
   Binding result;
   result.kind = Binding::Kind::Fragment;
   result.fragmentFamily = fragment.getFamily().str();
+  if (grouped) {
+    const int64_t parts = riscv::fragmentPartCount(fragment);
+    const std::string suffix = "i8m" + std::to_string(parts);
+    const std::string raw = fresh("ime_field_group");
+    line("vint8m" + std::to_string(parts) + "_t " + raw + " = __riscv_vle8_v_" + suffix +
+         "((const int8_t *)" + fieldStorageAddress(owner, *field, storage->byte) + ", " +
+         std::to_string(cells * parts) + ");");
+    for (int64_t part = 0; part < parts; ++part) {
+      result.parts.push_back(fresh("ime_field"));
+      line("vint8m1_t " + result.parts.back() + " = __riscv_vget_v_" + suffix + "_i8m1(" +
+           raw + ", " + std::to_string(part) + ");");
+    }
+    bindings[operation.getResult()] = std::move(result);
+    return mlir::success();
+  }
   for (int64_t part = 0; part < riscv::fragmentPartCount(fragment); ++part) {
   const std::string raw = fresh("ime_field_bytes");
   const std::string address = "((const uint8_t *)" + fieldStorageAddress(owner, *field, storage->byte) +
@@ -253,24 +282,45 @@ mlir::LogicalResult Emitter::compileIMEFragmentDecode(riscv::IMEFragmentDecodeOp
   auto constant = operation.getShift().getDefiningOp<mlir::arith::ConstantIndexOp>();
   const std::optional<int64_t> knownShift = constant
       ? std::optional<int64_t>(constant.value()) : std::nullopt;
+  const bool grouped = operation.getLeaf().getInstruction() == "ime.decode.grouped-bits";
+  const int64_t parts = riscv::fragmentPartCount(fragment);
+  const std::string group = "m" + std::to_string(grouped ? parts : 1);
   const std::string vl = std::to_string(fragment.getPacking().getRowsPerTile() *
-                                       fragment.getPacking().getColumnsPerTile());
+      fragment.getPacking().getColumnsPerTile() * (grouped ? parts : 1));
+  llvm::SmallVector<std::string> operands(input.parts.begin(), input.parts.end());
+  if (grouped) {
+    const std::string packed = fresh("ime_decode_input");
+    line("vint8" + group + "_t " + packed + " = __riscv_vundefined_i8" + group + "();");
+    for (auto [part, value] : llvm::enumerate(input.parts))
+      line(packed + " = __riscv_vset_v_i8m1_i8" + group + "(" + packed + ", " +
+           std::to_string(part) + ", " + value + ");");
+    operands = {packed};
+  }
   Binding result;
   result.kind = Binding::Kind::Fragment;
   result.fragmentFamily = fragment.getFamily().str();
-  for (const std::string &part : input.parts) {
-    std::string expression = "__riscv_vreinterpret_v_i8m1_u8m1(" + part + ")";
+  for (const std::string &part : operands) {
+    std::string expression = "__riscv_vreinterpret_v_i8" + group + "_u8" + group + "(" + part + ")";
     if (knownShift != 0)
-      expression = "__riscv_vsrl_vx_u8m1(" + expression + ", " + shift.scalar + ", " + vl + ")";
+      expression = "__riscv_vsrl_vx_u8" + group + "(" + expression + ", " + shift.scalar + ", " + vl + ")";
     if (knownShift != 8 - bits)
-      expression = "__riscv_vand_vx_u8m1(" + expression + ", " +
+      expression = "__riscv_vand_vx_u8" + group + "(" + expression + ", " +
                    std::to_string((1u << bits) - 1) + ", " + vl + ")";
-    expression = "__riscv_vreinterpret_v_u8m1_i8m1(" + expression + ")";
+    expression = "__riscv_vreinterpret_v_u8" + group + "_i8" + group + "(" + expression + ")";
     if (operation.getSignedElements())
-      expression = "__riscv_vsra_vx_i8m1(__riscv_vsll_vx_i8m1(" + expression + ", " +
+      expression = "__riscv_vsra_vx_i8" + group + "(__riscv_vsll_vx_i8" + group + "(" + expression + ", " +
                    std::to_string(8 - bits) + ", " + vl + "), " + std::to_string(8 - bits) + ", " + vl + ")";
-    result.parts.push_back(fresh("ime_decode"));
-    line("vint8m1_t " + result.parts.back() + " = " + expression + ";");
+    const std::string decoded = fresh("ime_decode");
+    line("vint8" + group + "_t " + decoded + " = " + expression + ";");
+    if (grouped) {
+      for (int64_t index = 0; index < parts; ++index) {
+        result.parts.push_back(fresh("ime_decode_part"));
+        line("vint8m1_t " + result.parts.back() + " = __riscv_vget_v_i8" + group +
+             "_i8m1(" + decoded + ", " + std::to_string(index) + ");");
+      }
+    } else {
+      result.parts.push_back(decoded);
+    }
   }
   bindings[operation.getResult()] = std::move(result);
   return mlir::success();
@@ -311,6 +361,28 @@ mlir::LogicalResult Emitter::compileIMEFragmentRowBroadcast(riscv::IMEFragmentRo
     bindings[operation.getResult()] = std::move(result);
     return mlir::success();
   }
+  if (operation.getLeaf().getInstruction() == "ime.rows.indices") {
+    std::string source = input->parts.front();
+    if (suffix != "i8m1")
+      source = "__riscv_vlmul_ext_v_" + suffix + "_i8m1(" + source + ")";
+    const std::string vl = std::to_string(rows * 8);
+    const std::string base = fresh("row_index");
+    line("vuint8m1_t " + base + " = __riscv_vsrl_vx_u8m1(__riscv_vid_v_u8m1(" +
+         vl + "), 3, " + vl + ");");
+    for (int64_t part = 0; part < parts; ++part) {
+      std::string index = base;
+      if (part) {
+        index = fresh("row_index");
+        line("vuint8m1_t " + index + " = __riscv_vadd_vx_u8m1(" + base + ", " +
+             std::to_string(part * rows) + ", " + vl + ");");
+      }
+      result.parts.push_back(fresh("fragment_rows"));
+      line("vint8m1_t " + result.parts.back() + " = __riscv_vrgather_vv_i8m1(" +
+           source + ", " + index + ", " + vl + ");");
+    }
+    bindings[operation.getResult()] = std::move(result);
+    return mlir::success();
+  }
   if (operation.getLeaf().getInstruction() != "ime.rows.local")
     return fail(operation, "fragment broadcast has no selected local realization");
   std::string source = input->parts.front();
@@ -331,7 +403,7 @@ mlir::LogicalResult Emitter::compileIMEFragmentRowBroadcast(riscv::IMEFragmentRo
     outputs += ", [part" + std::to_string(part) + "] \"=&vr\"(" + result.parts[part] + ")";
   }
   line(outputs);
-  line("  : [source] \"vr\"(" + source + "), [vl] \"r\"((size_t)" + std::to_string(rows * 8) + "));");
+  line("  : [source] \"vr\"(" + source + "), [vl] \"r\"((size_t)" + std::to_string(rows * 8) + ") : \"vl\", \"vtype\");");
   bindings[operation.getResult()] = std::move(result);
   return mlir::success();
 }
@@ -349,6 +421,31 @@ mlir::LogicalResult Emitter::compileIMEFragmentPointwise(riscv::IMEFragmentPoint
   Binding result;
   result.kind = Binding::Kind::Fragment;
   result.fragmentFamily = fragment.getFamily().str();
+  if (operation.getLeaf().getInstruction() == ("ime.fragment." + operation.getKind() + ".grouped").str()) {
+    if (rhs->kind != Binding::Kind::Fragment || rhs->parts.size() != lhs.parts.size())
+      return fail(operation, "grouped fragment pointwise lost its matching fragment operand");
+    const int64_t parts = riscv::fragmentPartCount(fragment);
+    const std::string group = "m" + std::to_string(parts);
+    auto pack = [&](llvm::ArrayRef<std::string> values) {
+      auto packed = fresh("ime_pointwise_input");
+      line("vint8" + group + "_t " + packed + " = __riscv_vundefined_i8" + group + "();");
+      for (auto [part, value] : llvm::enumerate(values))
+        line(packed + " = __riscv_vset_v_i8m1_i8" + group + "(" + packed + ", " +
+             std::to_string(part) + ", " + value + ");");
+      return packed;
+    };
+    const std::string left = pack(lhs.parts), right = pack(rhs->parts);
+    line(left + " = __riscv_v" + operation.getKind().str() + "_vv_i8" + group + "(" +
+         left + ", " + right + ", " + std::to_string(fragment.getPacking().getRowsPerTile() * columns * parts) + ");");
+    for (int64_t part = 0; part < parts; ++part) {
+      const bool reuse = operation.getLhsPolicy() == "reuse";
+      result.parts.push_back(reuse ? lhs.parts[part] : fresh("ime_pointwise"));
+      line((reuse ? "" : "vint8m1_t ") + result.parts.back() + " = __riscv_vget_v_i8" + group +
+           "_i8m1(" + left + ", " + std::to_string(part) + ");");
+    }
+    bindings[operation.getResult()] = std::move(result);
+    return mlir::success();
+  }
   for (int64_t part = 0; part < riscv::fragmentPartCount(fragment); ++part) {
   std::string expression;
   if (rhs->kind == Binding::Kind::Scalar) {

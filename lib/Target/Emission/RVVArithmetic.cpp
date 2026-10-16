@@ -1184,13 +1184,18 @@ mlir::LogicalResult Emitter::compileCastImpl(ConversionOp operation) {
     bindings[operation.getResult()] = std::move(result);
     return mlir::success();
   }
-  if (selected == "rvv.convert.i32-f32" && !rounding && sourceInteger &&
-      sourceInteger.getWidth() == 32 && target.isF32()) {
-    if (layoutOf(inputValue).getLmulEighths() != layoutOf(resultValue).getLmulEighths())
-      return fail(operation, "selected i32/f32 cast requires one unchanged register mapping");
+  if (!rounding && sourceInteger && target.isF32() &&
+      ((selected == "rvv.convert.i32-f32" && sourceInteger.getWidth() == 32) ||
+       (selected == "rvv.convert.i16-f32" && sourceInteger.getWidth() == 16))) {
+    const bool widening = selected == "rvv.convert.i16-f32";
+    if (layoutOf(inputValue).getLmulEighths() * (widening ? 2 : 1) !=
+        layoutOf(resultValue).getLmulEighths())
+      return fail(operation, "selected integer/f32 cast requires its width-preserving lane mapping");
     Binding result;
     result.kind = Binding::Kind::Vector;
-    const std::string intrinsic = sourceInteger.isSigned() ? "__riscv_vfcvt_f_x_v_" : "__riscv_vfcvt_f_xu_v_";
+    const std::string intrinsic = widening
+        ? (sourceInteger.isSigned() ? "__riscv_vfwcvt_f_x_v_" : "__riscv_vfwcvt_f_xu_v_")
+        : (sourceInteger.isSigned() ? "__riscv_vfcvt_f_x_v_" : "__riscv_vfcvt_f_xu_v_");
     for (int64_t part = 0; part < vectorPartCount(operation.getResult()); ++part) {
       auto sourcePart = mappedPart(operation.getOperation(), 0, part);
       if (!sourcePart || *sourcePart >= input->parts.size())
@@ -1377,6 +1382,12 @@ mlir::LogicalResult Emitter::compileWiden(riscv::WidenOp operation) {
       auto integer = mlir::cast<mlir::IntegerType>(source);
       expression = std::string(integer.isSigned() ? "__riscv_vfcvt_f_x_v_"
                                                    : "__riscv_vfcvt_f_xu_v_") +
+                   targetSuffix + "(" + sourceExpression + ", " + vl + ")";
+    }
+    else if (selected == "rvv.convert.i16-f32" && source.isInteger(16) && target.isF32()) {
+      auto integer = mlir::cast<mlir::IntegerType>(source);
+      expression = std::string(integer.isSigned() ? "__riscv_vfwcvt_f_x_v_"
+                                                 : "__riscv_vfwcvt_f_xu_v_") +
                    targetSuffix + "(" + sourceExpression + ", " + vl + ")";
     }
     else if (selected == "rvv.identity")
@@ -2419,7 +2430,7 @@ mlir::LogicalResult Emitter::compileRVVSplat(riscv::RVVSplatOp operation) {
            lmulSpelling(layout.getLmulEighths()) + ", ta, ma\\n\\t" +
            (floating ? "vfmv.v.f" : "vmv.v.x") + " %0, %2\" : \"=vr\"(" + name +
            ") : \"r\"((size_t)" + partVL(operation.getResult(), part) + "), \"" +
-           (floating ? "f" : "r") + "\"(" + scalarValue.scalar + "));");
+           (floating ? "f" : "r") + "\"(" + scalarValue.scalar + ") : \"vl\", \"vtype\");");
       result.parts.push_back(std::move(name));
     }
     bindings[operation.getResult()] = std::move(result);

@@ -21,6 +21,15 @@ static llvm::json::Value cacheJSON(const std::optional<RISCVDataCache> &cache) {
 Context::Context() {
   std::string error;
   require(queryNativeRISCVTarget(native, error), WEFT_TARGET_ERROR, error);
+#if defined(__linux__)
+  CPU_ZERO(&allowedCPUs);
+  for (int cpu : native.cpus) CPU_SET(cpu, &allowedCPUs);
+  for (const auto &[extension, cpus] : native.matrixExtensions) {
+    auto &mask = extensionCPUs[extension];
+    CPU_ZERO(&mask);
+    for (int cpu : cpus) CPU_SET(cpu, &mask);
+  }
+#endif
   llvm::json::Array cpus;
   for (int cpu : native.cpus) cpus.push_back(cpu);
   llvm::json::Object isa, matrix;
@@ -42,27 +51,61 @@ Context::Context() {
       {"matrix_extensions", std::move(matrix)}})).str();
 }
 
+void Context::requireAvailable(const std::vector<std::string> &extensions) const {
+#if defined(__linux__) && defined(__riscv)
+  cpu_set_t available = allowedCPUs;
+  for (const auto &extension : extensions) {
+    auto found = extensionCPUs.find(extension);
+    if (found == extensionCPUs.end())
+      throw Failure(WEFT_TARGET_ERROR, extension + " is unavailable in the discovered CPU set");
+    CPU_AND(&available, &available, &found->second);
+  }
+  if (!CPU_COUNT(&available))
+    throw Failure(WEFT_TARGET_ERROR, "artifact extensions have no common execution CPU");
+#else
+  (void)extensions;
+  throw Failure(WEFT_TARGET_ERROR, "native execution requires RISC-V Linux");
+#endif
+}
+
 void Context::check(const std::vector<std::string> &extensions) const {
+  verifyThread(extensions, false);
+}
+
+void Context::bindThread(const std::vector<std::string> &extensions) const {
+  verifyThread(extensions, true);
+}
+
+void Context::verifyThread(const std::vector<std::string> &extensions, bool bind) const {
 #if defined(__linux__) && defined(__riscv)
   int control = prctl(70, 0UL, 0UL, 0UL, 0UL);
-  require(control >= 0 && (control & 3) != 1, WEFT_TARGET_ERROR,
-          "calling thread has no enabled RISC-V vector state");
+  if (control < 0 || (control & 3) == 1)
+    throw Failure(WEFT_TARGET_ERROR, "calling thread has no enabled RISC-V vector state");
   cpu_set_t current;
-  require(sched_getaffinity(0, sizeof(current), &current) == 0, WEFT_TARGET_ERROR,
-          std::string("cannot query execution affinity: ") + strerror(errno));
-  for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
-    if (!CPU_ISSET(cpu, &current)) continue;
-    require(std::find(native.cpus.begin(), native.cpus.end(), cpu) != native.cpus.end(),
-            WEFT_TARGET_ERROR, "execution affinity exceeds the discovered CPU set");
-    for (const auto &extension : extensions) {
-      auto found = native.matrixExtensions.find(extension);
-      require(found != native.matrixExtensions.end() &&
-              std::find(found->second.begin(), found->second.end(), cpu) != found->second.end(),
-              WEFT_TARGET_ERROR, extension + " is unavailable on execution CPU " + std::to_string(cpu));
-    }
+  if (sched_getaffinity(0, sizeof(current), &current) != 0)
+    throw Failure(WEFT_TARGET_ERROR, std::string("cannot query execution affinity: ") + strerror(errno));
+  cpu_set_t intersection;
+  CPU_AND(&intersection, &current, &allowedCPUs);
+  if (!CPU_EQUAL(&intersection, &current))
+    throw Failure(WEFT_TARGET_ERROR, "execution affinity exceeds the discovered CPU set");
+  cpu_set_t eligible = current;
+  for (const auto &extension : extensions) {
+    auto found = extensionCPUs.find(extension);
+    if (found == extensionCPUs.end())
+      throw Failure(WEFT_TARGET_ERROR, extension + " is unavailable on execution affinity");
+    CPU_AND(&eligible, &eligible, &found->second);
+    if (!bind && !CPU_EQUAL(&eligible, &current))
+      throw Failure(WEFT_TARGET_ERROR, extension + " is unavailable on execution affinity");
+  }
+  if (bind && !CPU_EQUAL(&eligible, &current)) {
+    if (!CPU_COUNT(&eligible))
+      throw Failure(WEFT_TARGET_ERROR, "current affinity has no CPU supporting the artifact extensions");
+    if (sched_setaffinity(0, sizeof(eligible), &eligible) != 0)
+      throw Failure(WEFT_TARGET_ERROR, std::string("cannot bind extension execution affinity: ") + strerror(errno));
   }
 #else
   (void)extensions;
+  (void)bind;
   throw Failure(WEFT_TARGET_ERROR, "native execution requires RISC-V Linux");
 #endif
 }
@@ -141,7 +184,7 @@ Kernel::Kernel(std::shared_ptr<Context> context, const std::string &directory)
   for (const auto &name : required)
     require(std::find(usedExtensions.begin(), usedExtensions.end(), name) != usedExtensions.end(),
             WEFT_ABI_ERROR, "artifact did not fulfill required extension " + name);
-  this->context->check(usedExtensions);
+  this->context->requireAvailable(usedExtensions);
 
   dimensions = strings(metadata, "shape_parameters");
   for (const auto &[name, value] : object(metadata, "bindings")) {

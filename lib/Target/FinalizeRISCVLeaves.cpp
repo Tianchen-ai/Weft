@@ -64,6 +64,61 @@ std::optional<uint64_t> indexResidue(mlir::Value value, uint64_t modulus,
                                             : *lhs * *rhs) & mask;
 }
 
+void foldConstantReplicaLayers(mlir::IRRewriter &rewriter, mlir::ModuleOp module) {
+  module.walk([&](riscv::RVVReplicaStorageLoadOp load) {
+    auto kernel = load->getParentOfType<riscv::KernelOp>();
+    if (!kernel || kernel.getResourcesMaterialized() ||
+        load.getAccess().getMapping() != "grouped_layered") return;
+    auto base = riscv_internal::constantInt(load.getLogicalBase());
+    auto plan = load.getPlan();
+    const int64_t group = load.getAccess().getGroupSize();
+    const int64_t layer = load.getAccess().getLayerSize();
+    if (!base || *base < 0 || group <= 0 || layer <= 0 || group % layer ||
+        *base % layer || plan.getProjectionExtent() > layer ||
+        llvm::any_of(load.getLayerForPart(), [](int64_t value) { return value != 0; }))
+      return;
+    const int64_t logicalLayer = (*base % group) / layer;
+    if (logicalLayer == 0 && plan.getOffsetAlignment() % group == 0) return;
+    const int64_t bits = plan.getElementBits();
+    const int64_t physicalLayer = load.getAccess().getOrder() == "lo_first"
+                                      ? logicalLayer : group / layer - 1 - logicalLayer;
+    const int64_t mask = (physicalLayer + 1) * bits == 8 ? 0 : (int64_t{1} << bits) - 1;
+    // Index residue folding exposes constant layer bases after issue unroll.
+    // Move only the layer coordinate into the existing decode map; the byte
+    // address and read snapshot stay unchanged at the complete group origin.
+    rewriter.setInsertionPoint(load);
+    const int64_t groupBase = *base - *base % group;
+    mlir::Value alignedBase;
+    if (load.getLogicalBase().getType().isIndex())
+      alignedBase = rewriter.create<mlir::arith::ConstantIndexOp>(load.getLoc(), groupBase);
+    else {
+      auto type = mlir::cast<mlir::IntegerType>(load.getLogicalBase().getType());
+      alignedBase = rewriter.create<riscv::ConstantOp>(
+          load.getLoc(), type, rewriter.getIntegerAttr(type, groupBase));
+    }
+    auto alignedPlan = riscv::StorageWindowPlanAttr::get(
+        rewriter.getContext(), plan.getKind(), plan.getReductionAxis(),
+        plan.getProjectionBase(), plan.getProjectionStride(), plan.getProjectionRepeat(),
+        plan.getProjectionExtent(), group, plan.getRecordElements(),
+        plan.getByteOffset(), bits, plan.getGroupSize(), plan.getLayerSize(),
+        plan.getPhysicalLayerBase(), plan.getPhysicalLayerStep(), plan.getShiftBase(),
+        plan.getShiftStep(), plan.getMaskValue());
+    auto parts = [&](int64_t value) {
+      return rewriter.getDenseI64ArrayAttr(
+          llvm::SmallVector<int64_t>(load.getLayerForPart().size(), value));
+    };
+    rewriter.modifyOpInPlace(load, [&] {
+      load.getLogicalBaseMutable().assign(alignedBase);
+      load.setPlanAttr(alignedPlan);
+      load.setLayerForPartAttr(parts(logicalLayer));
+      load.setPhysicalLayerForPartAttr(parts(physicalLayer));
+      load.setShiftOffsetForPartAttr(parts(physicalLayer * bits));
+      load.setShiftBaseFactorForPartAttr(parts(0));
+      load.setMaskValueForPartAttr(parts(mask));
+    });
+  });
+}
+
 void foldPhysicalIndexRemainders(mlir::ModuleOp module) {
   mlir::IRRewriter rewriter(module.getContext());
   llvm::SmallVector<mlir::Operation *> candidates;
@@ -106,6 +161,7 @@ void foldPhysicalIndexRemainders(mlir::ModuleOp module) {
   if (folded)
     llvm::errs() << "weft-index-residue: constant-remainders=" << folded
                  << " visits-per-query<=64\n";
+  foldConstantReplicaLayers(rewriter, module);
 }
 
 bool isIntegerZero(mlir::Value value, unsigned &remaining) {
@@ -326,7 +382,7 @@ void selectUnsignedNarrowShifts(mlir::ModuleOp module) {
         shift->getBlock() != narrow->getBlock() || !shift.getResult().hasOneUse())
       continue;
     auto input = mlir::dyn_cast<riscv::ValueType>(shift.getResult().getType());
-    if (!riscv::supportsRVVWidenAdd(kernel.getTarget(), result, result, input))
+    if (!riscv::supportsRVVWidenBinary(kernel.getTarget(), result, result, input))
       continue;
     const bool splatInput = isSingletonScalar(shift.getLhs().getType(),
                                              input.getElementType());
@@ -534,6 +590,16 @@ mlir::LogicalResult materializeFieldReads(mlir::ModuleOp module) {
   llvm::SmallVector<riscv::FieldOp> fields;
   module.walk([&](riscv::FieldOp field) { fields.push_back(field); });
   for (auto field : fields) {
+    auto readsStorage = [&](mlir::Operation *user) {
+      auto effects = mlir::dyn_cast<mlir::MemoryEffectOpInterface>(user);
+      if (!effects) return false;
+      llvm::SmallVector<mlir::MemoryEffects::EffectInstance> instances;
+      effects.getEffects(instances);
+      return llvm::any_of(instances, [&](const auto &effect) {
+        return mlir::isa<mlir::MemoryEffects::Read>(effect.getEffect()) &&
+               effect.getValue() == field.getResult();
+      });
+    };
     auto result = mlir::dyn_cast<riscv::ValueType>(field.getResult().getType());
     auto encoding = mlir::dyn_cast<kernel::EncodingType>(
         riscv_internal::logicalElement(field.getOwner().getType()));
@@ -543,9 +609,7 @@ mlir::LogicalResult materializeFieldReads(mlir::ModuleOp module) {
         !((access.getAlignment() < 2 && riscv_internal::logicalBitWidth(result.getElementType()) == 16) ||
           (access.getForm() == "unit" && riscv_internal::fieldFacts(field).scalarPerRecord)) ||
         riscv_internal::interleaveRows(field, encoding) <= 0 ||
-        llvm::all_of(field.getResult().getUsers(), [](mlir::Operation *user) {
-          return mlir::isa<riscv::FieldReadOp>(user);
-        }))
+        llvm::all_of(field.getResult().getUsers(), readsStorage))
       continue;
     auto temporaries = riscv::fieldReadTemporaryGroups(field.getResult(), result, access, {});
     if (!temporaries)
@@ -556,7 +620,10 @@ mlir::LogicalResult materializeFieldReads(mlir::ModuleOp module) {
         field.getResult(), mlir::ValueRange{}, access,
         riscv_internal::leaf(rewriter, "transfer", "field-read", instruction,
                             instruction, 0, 0, *temporaries, 0, "none", "exact"));
-    field.getResult().replaceAllUsesExcept(read.getResult(), read);
+    // Explicit reads consume the storage projection, not another read's value.
+    field.getResult().replaceUsesWithIf(read.getResult(), [&](mlir::OpOperand &use) {
+      return !readsStorage(use.getOwner());
+    });
     riscv_internal::copyOrigin(field, read);
   }
   llvm::SmallVector<riscv::ConvertLayoutOp> candidates;

@@ -224,7 +224,7 @@ public:
       rewriter.setInsertionPoint(extract);
       auto conversion = rewriter.create<riscv::ConvertLayoutOp>(extract.getLoc(), supplied, extract.getInput(),
           riscv_internal::conversion(rewriter, "lane_repack", "pure",
-              riscv::rvvLayoutRepackTemporaryGroups(input, supplied)),
+              riscv::rvvLayoutRepackTemporaryGroups(extract->getParentOfType<riscv::KernelOp>().getTarget(), input, supplied)),
           riscv::AccessAttr(), riscv_internal::unselectedLeaf(rewriter));
       riscv_internal::copyOrigin(extract, conversion);
       extract.getInputMutable().assign(conversion.getResult());
@@ -339,6 +339,22 @@ public:
               changed = true;
               continue;
             }
+          }
+        }
+        // Complete hardware subregisters need no lane shuffle. Freeze that
+        // coordinate mapping before backward propagation can narrow its
+        // producer; the explicit edge owns the result's live register parts.
+        if (conversion.getConversion().getKind() == "tuple" &&
+            isPureRepresentationConversion(conversion)) {
+          auto target = conversion->getParentOfType<riscv::KernelOp>().getTarget();
+          auto source = conversion.getInput().getType();
+          auto result = conversion.getResult().getType();
+          if (riscv::isRVVSubregisterRepack(target, source, result) ||
+              riscv::isRVVSubregisterRepack(target, result, source)) {
+            conversion.setConversionAttr(riscv_internal::conversion(rewriter,
+                "lane_repack", "pure", riscv::rvvLayoutRepackTemporaryGroups(target, source, result)));
+            conversion.setLeafAttr(riscv_internal::unselectedLeaf(rewriter));
+            changed = true;
           }
         }
         // A selected coordinate exchange may cancel its exact inverse, but
@@ -562,6 +578,11 @@ public:
               continue;
           }
           if (extract->hasAttr("index_pattern")) {
+            auto pattern = extract->getAttrOfType<mlir::DenseI64ArrayAttr>("index_pattern");
+            if (extract.getAccess().getForm() == "register" &&
+                !riscv::rvvRegularGatherIndices(extract.getInput().getType(), targetType,
+                                                 pattern.asArrayRef()))
+              continue;
             rewriter.setInsertionPoint(conversion);
             auto rematerialized = rewriter.create<riscv::ExtractOp>(
                 extract.getLoc(), conversion.getResult().getType(),
@@ -688,7 +709,14 @@ public:
             continue;
           }
           auto kernel = conversion->getParentOfType<riscv::KernelOp>();
-          riscv::LayoutAttr required = integerReinterpret
+          const bool sameElementPointwise =
+              ((mlir::isa<riscv::BinaryOp, riscv::UnaryOp>(producer) &&
+                operandType.getElementType() == targetValue.getElementType()) ||
+               (mlir::isa<riscv::CastOp, riscv::WidenOp, riscv::NarrowOp>(producer) &&
+                operandType.getLayout().getSew() == targetValue.getLayout().getSew())) &&
+              operandType.getShape() == targetValue.getShape() &&
+              operandType.getAxisIds() == targetValue.getAxisIds();
+          riscv::LayoutAttr required = (integerReinterpret || sameElementPointwise)
               ? targetType.getLayout()
               : riscv_internal::projectLayout(
                     rewriter, operandType, targetType.getLayout(),
@@ -818,7 +846,7 @@ public:
         continue;
       const int64_t packLMUL = sourceLMUL * pieces;
       auto layout = target.getLayout();
-      if (packLMUL <= layout.getLmulEighths())
+      if (packLMUL == layout.getLmulEighths())
         continue;
       auto replicas = riscv_internal::staticProduct(
           layout.getReplicaFactors().asArrayRef());
@@ -838,9 +866,9 @@ public:
       if (!riscv::supportsRVVLayout(kernel.getTarget(), packLayout) ||
           !riscv::rvvPartToLanePieces(source, packType))
         continue;
-      // Minimum LMUL can leave unused capacity in each source part. Pack
-      // those numeric parts in their relative carrier, then explicitly resize
-      // to the consumer; neither step changes the logical lanes or read point.
+      // The pack width is fixed by its source pieces. A consumer can require
+      // either less or more register capacity: preserve the closed pack first,
+      // then resize without changing logical lanes or the read point.
       rewriter.setInsertionPoint(conversion);
       auto pack = rewriter.create<riscv::ConvertLayoutOp>(
           conversion.getLoc(), packType, conversion.getInput(),

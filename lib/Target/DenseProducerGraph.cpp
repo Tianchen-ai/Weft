@@ -74,6 +74,7 @@ bool DenseProducerGraph::collect(Value value) {
     auto encoding = dyn_cast<kernel::EncodingType>(memory.getEncoding());
     bool completePrivate = bool(load.getRegion().getDefiningOp<riscv::LocalViewOp>());
     if (!encoding || encoding.getKind() != "dense" || load.getSnapshotStorage() ||
+        !riscv::isAddressableDenseDescriptor(load.getRegion()) ||
         memory.getShape() != type.getShape() || memory.getAxisIds() != type.getAxisIds() ||
         (logicalBitWidth(type) < 8 && !(type.getElementType().isInteger(1) && memory.getStorageBits() == 8))) return false;
     for (auto [position, axis] : llvm::enumerate(type.getAxisIds().asArrayRef())) {
@@ -328,8 +329,11 @@ bool DenseProducerGraph::analyze(bool required, bool allowGuards) {
     if (!type || type.getShape() != domain.getShape() || type.getAxisIds() != domain.getAxisIds() ||
         (stores.size() != sinks.size() && type.getElementType() != domain.getElementType()) ||
         sinks[position]->getBlock() != root->getBlock()) return false;
+    // A dense element type does not make an encoded field an affine address.
+    // Only an explicit memory view may be split into ordinary dense subviews.
     if (auto store = dyn_cast<riscv::StoreOp>(sinks[position]); store &&
-        (store.getRegion().getType().getShape() != type.getShape() ||
+        (!riscv::isAddressableDenseDescriptor(store.getRegion()) ||
+         store.getRegion().getType().getShape() != type.getShape() ||
          store.getRegion().getType().getAxisIds() != type.getAxisIds())) return false;
     auto previous = members;
     if (!collect(value)) return false;
@@ -360,7 +364,8 @@ bool DenseProducerGraph::analyze(bool required, bool allowGuards) {
       }
   for (auto [position, axis] : llvm::enumerate(domain.getAxisIds().asArrayRef())) {
     if (points[position] || domain.getShape()[position] <= 1 || domain.getLayout().getValidity() != "tail") continue;
-    for (Operation *scope = root; scope && !points[position]; scope = scope->getParentOp())
+    for (Operation *scope = root; scope && scope->getBlock() && !points[position];
+         scope = scope->getParentOp())
       for (Operation *previous = scope->getPrevNode(); previous; previous = previous->getPrevNode())
         if (auto origin = dyn_cast<riscv::PhysicalPointOp>(previous);
             origin && origin.getType().getDomain().getAxisId() == axis) {

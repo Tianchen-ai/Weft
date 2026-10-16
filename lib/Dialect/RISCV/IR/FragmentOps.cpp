@@ -120,13 +120,16 @@ std::optional<AccessAttr> weft::riscv::fragmentFieldReadAccess(
   const int64_t cohort = owner.getRegion().getType().getInterleaveRows();
   const int64_t rowAxis = result.getAxisIds()[packing.getAxisOrder()[0]];
   const int64_t innerAxis = result.getAxisIds()[packing.getAxisOrder()[1]];
+  const bool singleNaturalRow = cohort == 0 && rows == 1 &&
+      access.getMapping() == "natural";
   if (!integer || integer.isSignless() || integer.getWidth() > 8 ||
       source.getAxisIds()[0] != rowAxis || source.getAxisIds()[1] != innerAxis ||
       fieldType.getAxisIds() != source.getAxisIds() ||
       fieldType.getShape()[1] != owner.getRegion().getType().getElements() ||
       source.getShape()[1] != columns ||
-      cohort < rows || cohort % rows || access.getBitOffset() % 8 ||
-      access.getFieldChunkBytes() != columns || packing.getElementOrder() != "row_major" ||
+      (!singleNaturalRow && (cohort < rows || cohort % rows ||
+                             access.getFieldChunkBytes() != columns)) ||
+      access.getBitOffset() % 8 || packing.getElementOrder() != "row_major" ||
       (access.getMapping() != "natural" && access.getMapping() != "grouped_layered"))
     return std::nullopt;
   if (access.getMapping() == "natural" ? integer.getWidth() != 8
@@ -240,35 +243,46 @@ std::optional<int64_t> weft::riscv::fragmentPointwiseTemporaryGroups(
   return 2;
 }
 
+bool weft::riscv::supportsFragmentByteRepeat(
+    FragmentType fragment, ValueType rows, TargetAttr target) {
+  auto temporary = fragmentPointwiseTemporaryGroups(fragment, rows);
+  if (!temporary || *temporary != 2 || !supportsRVVLayout(target, rows.getLayout()))
+    return false;
+  auto layout = rows.getLayout();
+  auto packing = fragment.getPacking();
+  const int64_t parts = fragmentPartCount(fragment);
+  // The operand's physical rows determine coverage. A partial active M does
+  // not remove any rows from a transposed RHS with a complete N-by-K packing.
+  return packing.getColumnsPerTile() == 8 &&
+      packing.getElementOrder() == "row_major" && packing.getTileOrder() == "row_major" &&
+      fragment.getLayout().getReplicaFactors()[packing.getAxisOrder()[1]] == 1 &&
+      layout.getLaneFactors()[0] == packing.getRowsPerTile() * parts &&
+      packing.getRowsPerTile() * 64 == target.getVlenBits() &&
+      layout.getLmulEighths() == parts && layout.getVl() * 64 == target.getVlenBits() * parts &&
+      llvm::is_contained(target.getSupportedSEW().asArrayRef(), 64) &&
+      llvm::is_contained(target.getLegalLMULEighths().asArrayRef(), 8 * parts);
+}
+
 mlir::LogicalResult IMEFragmentRowBroadcastOp::verify() {
   auto fragment = getResult().getType();
   auto kernel = (*this)->getParentOfType<KernelOp>();
   auto temporary = fragmentPointwiseTemporaryGroups(fragment, getInput().getType());
   const int64_t parts = fragmentPartCount(fragment);
   const bool byteRepeat = getLeaf().getInstruction() == "ime.rows.byte-repeat";
+  const bool preparedIndices = getLeaf().getInstruction() == "ime.rows.indices";
   if (!kernel || !fragmentCapability(*this, fragment.getFamily()) ||
       !supportsRVVLayout(kernel.getTarget(), getInput().getType().getLayout()) ||
       !temporary || *temporary != 2 || fragment.getPacking().getColumnsPerTile() != 8 ||
       !exactLeaf(getLeaf(), "ime", "fragment-broadcast",
-                 byteRepeat ? "ime.rows.byte-repeat" : "ime.rows.local", "none", "exact") ||
-      getLeaf().getTemporaryGroups() != (byteRepeat ? 2 * parts : parts + 1) ||
+                 byteRepeat ? "ime.rows.byte-repeat" :
+                 preparedIndices ? "ime.rows.indices" : "ime.rows.local", "none", "exact") ||
+      (preparedIndices && (parts <= 1 || parts > 4)) ||
+      getLeaf().getTemporaryGroups() !=
+          (byteRepeat || preparedIndices ? 2 * parts : parts + 1) ||
       getLeaf().getFragmentGroups() || getLeaf().getLocalBytes())
     return emitOpError("fragment row broadcast requires a complete signed-byte row projection and local index resources");
-  if (byteRepeat) {
-    auto target = kernel.getTarget();
-    auto layout = getInput().getType().getLayout();
-    auto packing = fragment.getPacking();
-    // Output byte (row, column) is input[row]: a tail prefix p maps only
-    // to its own 8*p bytes, with no cross-row reduction or permutation.
-    if (packing.getElementOrder() != "row_major" || packing.getTileOrder() != "row_major" ||
-        fragment.getLayout().getReplicaFactors()[packing.getAxisOrder()[1]] != 1 ||
-        layout.getLaneFactors()[0] != packing.getRowsPerTile() * parts ||
-        packing.getRowsPerTile() * 64 != target.getVlenBits() ||
-        layout.getLmulEighths() != parts || layout.getVl() * 64 != target.getVlenBits() * parts ||
-        !llvm::is_contained(target.getSupportedSEW().asArrayRef(), 64) ||
-        !llvm::is_contained(target.getLegalLMULEighths().asArrayRef(), 8 * parts))
-      return emitOpError("byte-repeat broadcast requires eight byte copies in each full u64 lane");
-  }
+  if (byteRepeat && !supportsFragmentByteRepeat(fragment, getInput().getType(), kernel.getTarget()))
+    return emitOpError("byte-repeat broadcast requires eight byte copies in each full u64 lane");
   return mlir::success();
 }
 
@@ -397,28 +411,56 @@ mlir::LogicalResult IMEFragmentWindowLoadOp::verify() {
   return mlir::success();
 }
 
+bool weft::riscv::supportsFragmentGroupedLoad(FragmentType fragment, TargetAttr target) {
+  const int64_t parts = fragmentPartCount(fragment);
+  auto packing = fragment.getPacking();
+  return (parts == 2 || parts == 4) &&
+      fragment.getLayout().getValidity() == "full" && packing.getStorageBits() == 8 &&
+      packing.getRowsPerTile() * packing.getColumnsPerTile() * 8 == target.getVlenBits() &&
+      llvm::is_contained(target.getLegalLMULEighths().asArrayRef(), parts * 8);
+}
+
 mlir::LogicalResult IMEFragmentStorageLoadOp::verify() {
   auto expected = fragmentFieldReadAccess(getInput(), getResult().getType());
+  const auto instruction = getLeaf().getInstruction();
+  const bool grouped = instruction == "ime.field-raw-load.grouped" ||
+                       instruction == "ime.field-raw-load.grouped.scalar-prime";
+  const bool prime = instruction == "ime.field-raw-load.scalar-prime" ||
+                     instruction == "ime.field-raw-load.grouped.scalar-prime";
+  auto kernel = (*this)->getParentOfType<KernelOp>();
+  const char *spelling = grouped ? (prime ? "ime.field-raw-load.grouped.scalar-prime" : "ime.field-raw-load.grouped")
+                                 : (prime ? "ime.field-raw-load.scalar-prime" : "ime.field-raw-load");
   if (!expected || getAccess() != *expected ||
-      !exactLeaf(getLeaf(), "ime", "fragment-storage-load", "ime.field-raw-load", "none", "agnostic") ||
-      getLeaf().getTemporaryGroups() != 1 || getLeaf().getLocalBytes() ||
+      !exactLeaf(getLeaf(), "ime", "fragment-storage-load", spelling, "none", "agnostic") ||
+      getLeaf().getTemporaryGroups() != (grouped ? 0 : 1) || getLeaf().getLocalBytes() ||
       getLeaf().getFragmentGroups() != getResult().getType().getResourceGroups())
     return emitOpError("fragment field load requires one proven contiguous row/chunk tile");
+  if (grouped && (!kernel || !supportsFragmentGroupedLoad(getResult().getType(), kernel.getTarget())))
+    return emitOpError("grouped fragment load requires two or four complete register atoms in a legal RVV group");
+  if (prime && (getResult().getType().getLayout().getValidity() != "full" ||
+      getResult().getType().getPacking().getStorageBits() != 8 ||
+      fragmentPartCount(getResult().getType()) < 2 || fragmentPartCount(getResult().getType()) > 4))
+    return emitOpError("fragment scalar prime requires a complete two-to-four-atom byte supply");
   return mlir::success();
 }
 
 mlir::LogicalResult IMEFragmentDecodeOp::verify() {
   auto fragment = getInput().getType();
   const int64_t bits = getElementBits();
+  const bool grouped = getLeaf().getInstruction() == "ime.decode.grouped-bits";
+  auto kernel = (*this)->getParentOfType<KernelOp>();
   auto maximum = nonnegativeIndexUpperBound(getShift());
   if (getResult().getType() != fragment || fragment.getRole() == "accumulator" ||
       fragmentPartResourceGroups(fragment) != 1 ||
       (bits != 1 && bits != 2 && bits != 4) || !maximum || *maximum > 8 - bits ||
       !knownIndexMultipleOf(getShift(), bits) ||
-      !exactLeaf(getLeaf(), "ime", "fragment-decode", "ime.decode.bits", "none", "exact") ||
-      getLeaf().getTemporaryGroups() != 1 || getLeaf().getLocalBytes() ||
+      !exactLeaf(getLeaf(), "ime", "fragment-decode",
+                 grouped ? "ime.decode.grouped-bits" : "ime.decode.bits", "none", "exact") ||
+      getLeaf().getTemporaryGroups() != (grouped ? 0 : 1) || getLeaf().getLocalBytes() ||
       getLeaf().getFragmentGroups() != fragment.getResourceGroups())
     return emitOpError("fragment bit projection requires a bounded byte-local shift and closed replicas");
+  if (grouped && (!kernel || !supportsFragmentGroupedLoad(fragment, kernel.getTarget())))
+    return emitOpError("grouped fragment decode requires complete register atoms in one legal RVV group");
   return mlir::success();
 }
 
@@ -427,15 +469,21 @@ mlir::LogicalResult IMEFragmentPointwiseOp::verify() {
   auto rhs = mlir::dyn_cast<ValueType>(getRhs().getType());
   auto kernel = (*this)->getParentOfType<KernelOp>();
   const bool reuse = getLhsPolicy() == "reuse";
+  const auto baseInstruction = ("ime.fragment." + getKind()).str();
+  const bool grouped = getLeaf().getInstruction() == baseInstruction + ".grouped";
   if (!temporaries || !fragmentCapability(*this, getResult().getType().getFamily()) ||
       (rhs && (!kernel || !supportsRVVLayout(kernel.getTarget(), rhs.getLayout()))) ||
       getResult().getType() != getLhs().getType() ||
       (getKind() != "add" && getKind() != "sub") ||
       (getLhsPolicy() != "copy" && !reuse) || (reuse && !canReuseFragmentPointwise(*this)) ||
-      !exactLeaf(getLeaf(), "ime", "fragment-pointwise", ("ime.fragment." + getKind()).str(), "none", "exact") ||
+      !exactLeaf(getLeaf(), "ime", "fragment-pointwise",
+                 baseInstruction + (grouped ? ".grouped" : ""), "none", "exact") ||
       getLeaf().getTemporaryGroups() != *temporaries || getLeaf().getLocalBytes() ||
       getLeaf().getFragmentGroups() != (reuse ? 0 : getResult().getType().getResourceGroups()))
     return emitOpError("fragment pointwise requires its exact integer domain and scalar/row broadcast");
+  if (grouped && (getRhs().getType() != getLhs().getType() || !kernel ||
+                  !supportsFragmentGroupedLoad(getLhs().getType(), kernel.getTarget())))
+    return emitOpError("grouped fragment pointwise requires two matching complete register groups");
   return mlir::success();
 }
 
@@ -619,10 +667,24 @@ mlir::LogicalResult IMEZeroOp::verify() {
       fragment.getPacking() != capability.getAccumulatorPacking() ||
       !fragmentAccumulatorTypeMatches(capability, fragment.getElementType()) ||
       (!exactLeaf(getLeaf(), "ime", "fragment-init", "ime.zero", "none", "exact") &&
-       !exactLeaf(getLeaf(), "ime", "fragment-init", "ime.zero.local", "none", "exact")) ||
+       !exactLeaf(getLeaf(), "ime", "fragment-init", "ime.zero.local", "none", "exact") &&
+       !exactLeaf(getLeaf(), "ime", "fragment-init", "ime.zero.local-prefix", "none", "exact")) ||
       getLeaf().getLocalBytes() || getLeaf().getTemporaryGroups() ||
       getLeaf().getFragmentGroups())
     return emitOpError("fragment zero requires a closed accumulator representation");
+  if (getLeaf().getInstruction() == "ime.zero.local-prefix") {
+    auto target = (*this)->getParentOfType<KernelOp>().getTarget();
+    auto parameters = getLeaf().getParameters().asArrayRef();
+    const int64_t activeBits = fragment.getPacking().getRowsPerTile() *
+        fragment.getPacking().getColumnsPerTile() * elementBitWidth(fragment.getElementType());
+    if (parameters.size() != 1 || parameters[0] <= 0 ||
+        parameters[0] >= fragmentPartResourceGroups(fragment) * 8 ||
+        !llvm::is_contained(target.getLegalLMULEighths().asArrayRef(), parameters[0]) ||
+        activeBits * 8 != parameters[0] * target.getVlenBits())
+      return emitOpError("local fragment zero prefix must exactly cover its logical cells in a narrower legal carrier");
+  } else if (!getLeaf().getParameters().empty()) {
+    return emitOpError("ordinary fragment zero has no prefix carrier parameter");
+  }
   return mlir::success();
 }
 

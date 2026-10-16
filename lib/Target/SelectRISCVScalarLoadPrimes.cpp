@@ -4,6 +4,7 @@
 #include "RISCVPhysicalSupport.h"
 
 #include "Weft/Dialect/RISCV/IR/RISCVDialect.h"
+#include "Weft/Dialect/RISCV/IR/Fragment.h"
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
@@ -30,7 +31,7 @@ bool feedsPartialProgramInBlock(mlir::Value source, mlir::Block *block) {
       if (consumer->getBlock() != block)
         continue;
       if (mlir::isa<riscv::RVVPartialSetOp,
-                    riscv::RVVPartialCollectOp>(consumer))
+                    riscv::RVVPartialCollectOp, riscv::IMEFragmentMMAOp>(consumer))
         return true;
       if (consumer->getNumRegions() != 0 || consumer->getNumResults() != 1 ||
           !mlir::isMemoryEffectFree(consumer))
@@ -54,6 +55,22 @@ riscv::LeafAttr scalarPrimeLeaf(mlir::Builder &builder,
 bool selectFirstPartialStorageRead(mlir::scf::ForOp loop,
                                    mlir::Builder &builder) {
   for (mlir::Operation &operation : loop.getBody()->without_terminator()) {
+    if (auto load = mlir::dyn_cast<riscv::IMEFragmentStorageLoadOp>(operation)) {
+      auto type = load.getResult().getType();
+      const int64_t parts = riscv::fragmentPartCount(type);
+      if (parts < 2 || parts > 4 || type.getLayout().getValidity() != "full" ||
+          type.getPacking().getStorageBits() != 8 ||
+          !feedsPartialProgramInBlock(load.getResult(), loop.getBody()))
+        continue;
+      auto instruction = load.getLeaf().getInstruction();
+      if (instruction == "ime.field-raw-load.scalar-prime" ||
+          instruction == "ime.field-raw-load.grouped.scalar-prime") return true;
+      if (instruction != "ime.field-raw-load" && instruction != "ime.field-raw-load.grouped") return false;
+      load.setLeafAttr(scalarPrimeLeaf(builder, load.getLeaf(),
+          instruction == "ime.field-raw-load.grouped" ? "ime.field-raw-load.grouped.scalar-prime"
+                                                     : "ime.field-raw-load.scalar-prime"));
+      return true;
+    }
     if (auto load = mlir::dyn_cast<riscv::RVVReplicaStorageLoadOp>(operation)) {
       if (load.getPlan().getKind() != "layered" ||
           load.getWindowOffsets().size() != 1 ||
@@ -97,7 +114,7 @@ public:
     return "weft-riscv-select-scalar-load-primes";
   }
   llvm::StringRef getDescription() const override {
-    return "Select one target-local scalar-prime leaf for the first typed partial storage edge in each physical loop";
+    return "Select one target-local scalar-prime leaf for a typed contraction supply in each physical loop";
   }
 
   void runOnOperation() override {
@@ -112,8 +129,8 @@ public:
       selected |= selectFirstPartialStorageRead(loop, builder);
     if (!selected) {
       rejectRISCVCandidate(getOperation(), RISCVFailureCategory::Unsupported,
-          "scalar-load-prime binding requires one typed grouped/layered "
-          "storage edge feeding a partial set");
+          "scalar-load-prime binding requires a grouped/layered partial supply "
+          "or a complete multi-atom fragment storage supply");
       signalPassFailure();
     }
   }

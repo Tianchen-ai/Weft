@@ -4,6 +4,7 @@
 #include "RISCVPhysicalSupport.h"
 
 #include "Weft/Dialect/RISCV/IR/RISCVDialect.h"
+#include "Weft/Dialect/RISCV/IR/Layout.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/Matchers.h"
@@ -332,6 +333,10 @@ void decomposeShapedIndex(mlir::Value value, int64_t coefficient,
     if (conversion.getConversion().getEffect() != "pure")
       return result.valid = false, void();
     decomposeShapedIndex(conversion.getInput(), coefficient, result, depth + 1);
+    return;
+  }
+  if (auto broadcast = value.getDefiningOp<riscv::RVVAxisBroadcastOp>()) {
+    decomposeShapedIndex(broadcast.getInput(), coefficient, result, depth + 1);
     return;
   }
   if (auto cast = value.getDefiningOp<riscv::CastOp>()) {
@@ -1373,6 +1378,38 @@ bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
 
   const bool layered =
       extract.getAccess().getMapping() == "grouped_layered";
+  const auto consumerType = selectedType;
+  if (layered && selectedType.getLayout().getValidity() == "full" &&
+      selectedType.getLayout().getReplicaGroup() == 1 && hasContiguousLaneGeometry(selectedType)) {
+    auto before = selectedType.getLayout();
+    auto laneCount = riscv_internal::staticProduct(before.getLaneFactors().asArrayRef());
+    const int64_t layer = extract.getAccess().getLayerSize();
+    if (laneCount && layer > 0 && *laneCount > layer && *laneCount % layer == 0) {
+      int64_t factor = *laneCount / layer;
+      if (before.getLmulEighths() % factor) return false;
+      const int64_t lmul = before.getLmulEighths() / factor;
+      llvm::SmallVector<int64_t> time(before.getTimeFactors().asArrayRef());
+      llvm::SmallVector<int64_t> lanes(before.getLaneFactors().asArrayRef());
+      for (size_t axis = 0; axis < lanes.size() && factor > 1; ++axis) {
+        const int64_t split = std::gcd(lanes[axis], factor);
+        lanes[axis] /= split;
+        if (!checkedMultiply(time[axis], split, time[axis])) return false;
+        factor /= split;
+      }
+      auto replicas = riscv_internal::staticProduct(before.getReplicaFactors().asArrayRef());
+      if (factor != 1 || !replicas) return false;
+      auto groups = riscv_internal::staticProduct({*replicas, std::max<int64_t>(1, (lmul + 7) / 8)});
+      if (!groups) return false;
+      auto layout = riscv::LayoutAttr::get(rewriter.getContext(), "rvv", selectedType.getAxisIds(),
+          rewriter.getDenseI64ArrayAttr(time), rewriter.getDenseI64ArrayAttr(lanes),
+          before.getReplicaFactors(), before.getFragmentFactors(), before.getLocalFactors(),
+          before.getSew(), lmul, layer, *groups, "full");
+      auto narrow = mlir::cast<riscv::ValueType>(riscv_internal::withLayout(selectedType, layout));
+      if (!riscv::supportsRVVLayout(kernel.getTarget(), layout) ||
+          !riscv::rvvLayoutRepackSlices(narrow, selectedType)) return false;
+      selectedType = narrow;
+    }
+  }
   int64_t laneAxis = 0;
   size_t lanePosition = 0;
   llvm::SmallVector<size_t> lanePositions;
@@ -1585,16 +1622,29 @@ bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
 
   const int64_t group = extract.getAccess().getGroupSize();
   const int64_t layer = extract.getAccess().getLayerSize();
+  const int64_t elementBits =
+      riscv_internal::logicalBitWidth(selectedType.getElementType());
   if (layered &&
       (group <= 0 || layer <= 0 || group % layer || layer % lanes ||
-       group % logicalSpan ||
+       elementBits <= 0 || group / layer > 8 / elementBits ||
+       (logicalSpan > group &&
+        (8 % elementBits || group / layer != 8 / elementBits)) ||
+       (logicalSpan <= group ? group % logicalSpan : logicalSpan % group) ||
        (logicalSpan % layer && layer % logicalSpan) ||
-       (affine.scalarBase && scalarBaseMultiple % std::min(logicalSpan, layer)) || affine.constant != 0))
+       (logicalSpan > group && affine.scalarBase && scalarBaseMultiple % group) ||
+       (affine.scalarBase && scalarBaseMultiple % std::min(logicalSpan, layer))))
     return false;
-  if (!layered && !affine.scalarBase &&
-      affine.constant > fieldExtent - logicalSpan)
+  if (!affine.scalarBase && affine.constant > fieldExtent - logicalSpan)
     return false;
   if (affine.scalarBase && affine.constant != 0)
+    return false;
+  // A constant slice can start in a later encoded layer. Its lane interval
+  // must stay within the original field and preserve the window partition;
+  // the selected scalar base then supplies the exact layer shift below.
+  if (layered && !affine.scalarBase &&
+      (affine.constant % std::min(logicalSpan, layer) ||
+       (logicalSpan > group ? affine.constant % group != 0
+                            : affine.constant % group > group - logicalSpan)))
     return false;
 
   llvm::SmallVector<int64_t> windowOffsets;
@@ -1602,7 +1652,11 @@ bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
   llvm::SmallVector<int64_t> windowForPart;
   llvm::SmallVector<int64_t> layerForPart;
   for (auto [part, offset] : llvm::enumerate(partOffsets)) {
-    const int64_t windowOffset = layered ? offset % layer : offset;
+    // Layered offsets name raw bytes. Preserve the group coordinate as well
+    // as the byte position within a layer; only layers of the same group share
+    // a window. The emitter consumes this map without reconstructing it.
+    const int64_t windowOffset =
+        layered ? (offset / group) * layer + offset % layer : offset;
     int64_t windowId = -1;
     for (size_t candidate = 0; candidate < windowOffsets.size(); ++candidate) {
       if (windowOffsets[candidate] != windowOffset)
@@ -1621,7 +1675,7 @@ bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
       recordCoordinatesForWindow.append(recordCoordinatesForPart[part]);
     }
     windowForPart.push_back(windowId);
-    layerForPart.push_back(layered ? offset / layer : 0);
+    layerForPart.push_back(layered ? (offset % group) / layer : 0);
   }
 
   rewriter.setInsertionPoint(extract);
@@ -1658,7 +1712,7 @@ bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
       affine.scalarBase
           ? std::max<int64_t>(1, scalarBaseMultiple)
           : (affine.constant == 0
-                 ? logicalBaseAlignment
+                 ? (layered && logicalSpan > group ? group : logicalBaseAlignment)
                  : std::max<int64_t>(1, std::abs(affine.constant)));
   llvm::SmallVector<int64_t> physicalLayerForPart;
   llvm::SmallVector<int64_t> shiftOffsetForPart;
@@ -1669,8 +1723,6 @@ bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
   shiftBaseFactorForPart.reserve(layerForPart.size());
   maskValueForPart.reserve(layerForPart.size());
   const int64_t layerCount = layered ? group / layer : 1;
-  const int64_t elementBits =
-      riscv_internal::logicalBitWidth(selectedType.getElementType());
   for (int64_t logicalLayer : layerForPart) {
     if (!layered) {
       physicalLayerForPart.push_back(0);
@@ -1743,6 +1795,14 @@ bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
   if (auto canonical = extract->getAttr("canonical_op"))
     load->setAttr("canonical_op", canonical);
   mlir::Value replacement = load.getResult();
+  if (selectedType != consumerType) {
+    auto bridge = rewriter.create<riscv::ConvertLayoutOp>(extract.getLoc(), consumerType, replacement,
+        riscv_internal::conversion(rewriter, "lane_repack", "pure",
+            riscv::rvvLayoutRepackTemporaryGroups(kernel.getTarget(), selectedType, consumerType)),
+        riscv::AccessAttr(), riscv_internal::unselectedLeaf(rewriter));
+    riscv_internal::copyOrigin(extract, bridge);
+    replacement = bridge.getResult();
+  }
   if (consumerConversion) {
     consumerConversion.getResult().replaceAllUsesWith(replacement);
     rewriter.eraseOp(consumerConversion);
@@ -2254,6 +2314,105 @@ bool hasTypedStorageMaterialization(riscv::FieldOp field) {
   });
 }
 
+void projectReplicaIssueSupplies(mlir::IRRewriter &rewriter,
+                                 mlir::ModuleOp module) {
+  llvm::SmallVector<riscv::RVVReplicaStorageLoadOp> loads;
+  module.walk([&](riscv::RVVReplicaStorageLoadOp load) { loads.push_back(load); });
+  for (auto load : loads) {
+    auto source = load.getResult().getType();
+    const size_t partCount = load.getWindowForPart().size();
+    if (partCount <= 1 || load.getResult().use_empty())
+      continue;
+    llvm::SmallVector<riscv::RVVIssueSliceOp> slices;
+    llvm::SmallVector<bool> consumed(partCount, false);
+    bool closed = true;
+    for (auto *user : load.getResult().getUsers()) {
+      auto slice = mlir::dyn_cast<riscv::RVVIssueSliceOp>(user);
+      if (!slice || slice->getBlock() != load->getBlock()) {
+        closed = false;
+        break;
+      }
+      auto result = slice.getResult().getType();
+      if (result.getElementType() != source.getElementType() ||
+          result.getLayout().getSew() != source.getLayout().getSew() ||
+          result.getLayout().getLmulEighths() != source.getLayout().getLmulEighths() ||
+          result.getLayout().getVl() != source.getLayout().getVl() ||
+          result.getLayout().getValidity() != source.getLayout().getValidity() ||
+          !llvm::is_contained(result.getAxisIds().asArrayRef(),
+                              load.getPlan().getReductionAxis()) ||
+          llvm::any_of(slice.getLaneOffsets(), [](int64_t offset) { return offset != 0; })) {
+        closed = false;
+        break;
+      }
+      for (int64_t part : slice.getSourceParts()) {
+        if (part < 0 || part >= static_cast<int64_t>(partCount) || consumed[part]) {
+          closed = false;
+          break;
+        }
+        consumed[part] = true;
+      }
+      // Move each read only within its original block and across operations
+      // that cannot change the storage snapshot observed by the source load.
+      for (auto *cursor = load->getNextNode(); closed && cursor != user;
+           cursor = cursor->getNextNode())
+        if (!cursor || !isReadOnlyOrPure(cursor)) {
+          closed = false;
+          break;
+        }
+      if (!closed)
+        break;
+      slices.push_back(slice);
+    }
+    if (!closed || !llvm::all_of(consumed, [](bool value) { return value; }))
+      continue;
+
+    // The issue maps already select complete physical parts. Project the
+    // frozen window/decode map without reconstructing addresses or layouts.
+    for (auto slice : slices) {
+      llvm::SmallVector<int64_t> windows, offsets, coordinates, forPart;
+      llvm::SmallVector<int64_t> layers, physicalLayers, shifts, factors, masks;
+      for (int64_t part : slice.getSourceParts()) {
+        const int64_t window = load.getWindowForPart()[part];
+        auto found = llvm::find(windows, window);
+        if (found == windows.end()) {
+          forPart.push_back(windows.size());
+          windows.push_back(window);
+          offsets.push_back(load.getWindowOffsets()[window]);
+          for (int64_t coordinate = 0; coordinate < load.getRecordRank(); ++coordinate)
+            coordinates.push_back(load.getRecordCoordinatesForWindow()[
+                window * load.getRecordRank() + coordinate]);
+        } else {
+          forPart.push_back(found - windows.begin());
+        }
+        layers.push_back(load.getLayerForPart()[part]);
+        physicalLayers.push_back(load.getPhysicalLayerForPart()[part]);
+        shifts.push_back(load.getShiftOffsetForPart()[part]);
+        factors.push_back(load.getShiftBaseFactorForPart()[part]);
+        masks.push_back(load.getMaskValueForPart()[part]);
+      }
+      rewriter.setInsertionPoint(slice);
+      auto result = slice.getResult().getType();
+      auto selected = load.getLeaf();
+      auto projected = rewriter.create<riscv::RVVReplicaStorageLoadOp>(
+          slice.getLoc(), result, load.getField(), load.getLogicalBase(),
+          load.getPlan(), load.getRecordRank(),
+          rewriter.getDenseI64ArrayAttr(offsets), rewriter.getDenseI64ArrayAttr(coordinates),
+          rewriter.getDenseI64ArrayAttr(forPart), rewriter.getDenseI64ArrayAttr(layers),
+          rewriter.getDenseI64ArrayAttr(physicalLayers), rewriter.getDenseI64ArrayAttr(shifts),
+          rewriter.getDenseI64ArrayAttr(factors), rewriter.getDenseI64ArrayAttr(masks),
+          load.getAccess(), riscv_internal::leaf(
+              rewriter, selected.getEngine(), selected.getFamily(),
+              selected.getInstruction(), selected.getSpelling(), selected.getOperandGroups(),
+              result.getLayout().getRegisterGroups(), selected.getTemporaryGroups(),
+              selected.getFragmentGroups(), selected.getMask(), selected.getTail(),
+              selected.getParameters(), selected.getLocalBytes()));
+      riscv_internal::copyOrigin(load, projected);
+      rewriter.replaceOp(slice, projected.getResult());
+    }
+    rewriter.eraseOp(load);
+  }
+}
+
 class ShareRISCVLayeredWindowsPass
     : public mlir::PassWrapper<ShareRISCVLayeredWindowsPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -2296,7 +2455,7 @@ public:
           streamAxis = axis;
       auto geometry = buildLayeredStreamGeometry(
           rewriter, type, field.getAccess(), streamAxis, 0);
-      if (!geometry)
+      if (!geometry || !riscv::hasContiguousLayeredStreamStorage(field, type, *geometry))
         continue;
       rewriter.setInsertionPointAfter(field);
       auto stream = rewriter.create<riscv::RVVLayeredStreamOp>(
@@ -2748,7 +2907,7 @@ public:
     // decode result.  Distinct logical offsets are not CSE-equivalent; their
     // affine (raw-window, layer) decomposition is the proof used here.
     materializeSharedLayeredStorageWindows(rewriter, getOperation());
-
+    projectReplicaIssueSupplies(rewriter, getOperation());
   }
 };
 

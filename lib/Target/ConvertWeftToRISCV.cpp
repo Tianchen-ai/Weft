@@ -16,6 +16,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/AsmParser/AsmParser.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringMap.h"
 
@@ -491,6 +492,50 @@ private:
     return riscv_internal::integers(builder, extents);
   }
 
+  void refineCompleteDomains(kernel::KernelOp kernel) {
+    exactDomains.clear();
+    llvm::StringMap<llvm::SmallVector<int64_t>> multiples;
+    auto addMultiple = [&](int64_t shape, int64_t multiple) {
+      if (shape >= 0 || multiple <= 0) return;
+      const int64_t position = -shape - 1;
+      if (position >= static_cast<int64_t>(kernel.getShapeSymbols().size())) return;
+      auto name = mlir::cast<mlir::StringAttr>(kernel.getShapeSymbols()[position]).getValue();
+      multiples[name].push_back(multiple);
+    };
+    for (mlir::BlockArgument argument : kernel.getBody().front().getArguments()) {
+      auto view = mlir::dyn_cast<kernel::ViewType>(argument.getType());
+      if (!view || view.getShape().empty()) continue;
+      auto facts = encodingFacts(mlir::cast<kernel::EncodingType>(view.getEncoding()));
+      if (!facts) continue;
+      addMultiple(view.getShape().asArrayRef().back(), facts->elements);
+      if (facts->interleaveRows > 0 && view.getShape().size() == 2)
+        addMultiple(view.getShape()[0], facts->interleaveRows);
+    }
+    auto constant = [&](mlir::Value value) -> std::optional<int64_t> {
+      if (auto op = value.getDefiningOp<mlir::arith::ConstantIndexOp>()) return op.value();
+      if (auto symbol = value.getDefiningOp<kernel::SymbolOp>()) {
+        auto binding = currentBindings.find(symbol.getName());
+        if (binding != currentBindings.end()) return binding->second;
+      }
+      return std::nullopt;
+    };
+    kernel.walk([&](kernel::DomainOp domain) {
+      auto partition = constant(domain.getPartition());
+      if (!partition || *partition <= 0) return;
+      bool complete = false;
+      if (auto extent = constant(domain.getExtent()))
+        complete = *extent >= 0 && *extent % *partition == 0;
+      else if (auto symbol = domain.getExtent().getDefiningOp<kernel::SymbolOp>();
+               symbol && symbol.getKind() == "shape") {
+        auto found = multiples.find(symbol.getName());
+        complete = found != multiples.end() && llvm::any_of(found->second,
+            [&](int64_t multiple) { return multiple % *partition == 0; });
+      }
+      if (complete)
+        exactDomains.insert(mlir::cast<kernel::DomainType>(domain.getResult().getType()).getDomainId());
+    });
+  }
+
   mlir::Type convertType(mlir::Type type, llvm::StringRef addressClass = "slice",
                          llvm::StringRef access = "none", int64_t aliasSet = -1) {
     if (auto view = mlir::dyn_cast<kernel::ViewType>(type)) {
@@ -540,7 +585,7 @@ private:
       return riscv::DomainType::get(
           type.getContext(), domain.getAxisName(), domain.getDomainId(),
           domain.getParentDomainId(), domain.getAxisId(), domain.getRelation(),
-          domain.getTail());
+          exactDomains.contains(domain.getDomainId()) ? "exact" : domain.getTail());
     if (auto point = mlir::dyn_cast<kernel::PointType>(type))
       return riscv::PointType::get(
           type.getContext(), mlir::cast<riscv::DomainType>(
@@ -1098,6 +1143,7 @@ private:
     if (resolved == sourceBindings.end())
       return source.emitError("kernel escaped complete source binding validation");
     currentBindings = resolved->second;
+    refineCompleteDomains(source);
     for (auto [index, attribute] : llvm::enumerate(source.getShapeSymbols())) {
       auto name = mlir::cast<mlir::StringAttr>(attribute).getValue();
       auto bound = currentBindings.find(name);
@@ -1272,6 +1318,7 @@ private:
   mlir::OpBuilder &builder;
   mlir::IRMapping mapping;
   llvm::DenseMap<int64_t, int64_t> shapeBindings;
+  llvm::DenseSet<int64_t> exactDomains;
   llvm::StringMap<int64_t> currentBindings;
   llvm::DenseMap<mlir::Operation *, llvm::StringMap<int64_t>> sourceBindings;
   mlir::Value rootPoint;

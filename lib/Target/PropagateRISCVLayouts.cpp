@@ -810,6 +810,9 @@ void constrainOuterContractOperand(Contract operation, mlir::Value value,
   auto implementation = operation->template getAttrOfType<
       riscv::ImplementationAttr>("implementation");
   bool registerFloat = false;
+  if (implementation && implementation.getOperation() == "rvv.vmacc")
+    if (auto freeAxis = freeAxisSharedByOneOperand(operation.getLhs(), operation.getRhs()))
+      if (!llvm::is_contained(reduction, freeAxis)) lane = freeAxis;
   if (implementation && (implementation.getOperation() == "rvv.vfmacc" ||
                          implementation.getOperation() == "rvv.vfwmacc")) {
     auto lhsSupply = riscv_internal::queryContractionSupply(operation.getLhs());
@@ -856,6 +859,23 @@ void constrainOuterContractOperand(Contract operation, mlir::Value value,
     addSmallReplicas(value, roles, roles.laneAxis);
     return;
   }
+  if (implementation && implementation.getOperation() == "rvv.vmacc" && lane &&
+      !containsAxis(value.getType(), lane) && reduction.size() == 1 &&
+      riscv_internal::logicalAxes(value.getType()).size() == 1 &&
+      containsAxis(value.getType(), reduction[0]) &&
+      riscv_internal::physicalExtent(value, reduction[0]) > 0 &&
+      riscv_internal::physicalExtent(value, reduction[0]) <= 16 &&
+      [&] {
+        auto supply = reductionSupplyRoles(value, reduction);
+        return supply && supply->memoryAnchored;
+      }()) {
+    // A small memory operand used only as the scalar side of vx issues can
+    // arrive in GPRs directly. Vectorizing it creates a slide/extract and a
+    // vtype transition for every reduction coordinate.
+    roles.registerTuple = true;
+    addSmallReplicas(value, roles);
+    return;
+  }
   if (lane && containsAxis(value.getType(), lane))
     roles.laneAxis = lane;
   else
@@ -868,6 +888,21 @@ void constrainOuterContractOperand(Contract operation, mlir::Value value,
     if (!llvm::is_contained(reduction, axis) && axis != roles.laneAxis &&
         riscv_internal::physicalExtent(value, axis) > 0 && riscv_internal::physicalExtent(value, axis) <= 16)
       roles.replicaAxes.insert(axis);
+  if (implementation && implementation.getOperation() == "rvv.vmacc" &&
+      reduction.size() == 1 && roles.laneAxis &&
+      !llvm::is_contained(reduction, roles.laneAxis) &&
+      (value == operation.getLhs() || value == operation.getRhs())) {
+    // Keep the producer's contiguous memory window wide. Composite lowering
+    // projects one reduction coordinate at the use edge; it need not force
+    // every upstream load/decode/product into that narrow issue carrier.
+    auto supply = reductionSupplyRoles(value, {roles.laneAxis, reduction[0]}, true);
+    if (supply && supply->memoryAnchored && supply->laneAxis == roles.laneAxis &&
+        supply->coalescedLaneAxes.contains(reduction[0])) {
+      roles.coalescedLaneAxes.insert(reduction[0]);
+      roles.sequentialAxes.erase(reduction[0]);
+      roles.replicaAxes.erase(reduction[0]);
+    }
+  }
 }
 
 template <typename Contract>
@@ -876,6 +911,13 @@ void constrainReductionContractOperand(Contract operation, mlir::Value value,
   if (constrainFragmentContractOperand(operation, value, roles)) return;
   auto implementation = operation->template getAttrOfType<
       riscv::ImplementationAttr>("implementation");
+  if (implementation && implementation.getOperation() == "rvv.vmacc" &&
+      operation.getOver().size() == 1 &&
+      (hasOperandLocalFreeAxis(operation.getLhs(), operation.getRhs(), operation.getOver()) !=
+       hasOperandLocalFreeAxis(operation.getRhs(), operation.getLhs(), operation.getOver()))) {
+    constrainOuterContractOperand(operation, value, roles);
+    return;
+  }
   if (value == operation->getResult(0)) {
     if (auto fragment = selectedContractFragment(operation)) {
       auto packing = fragment.getAccumulatorPacking();
@@ -2670,8 +2712,18 @@ public:
             const bool domainProjection = alignedDomain && domains == 1 && resultType &&
                 inputType.getAxisIds() == resultType.getAxisIds() &&
                 inputExtent > resultExtent && resultExtent > 0 && inputExtent % resultExtent == 0;
+            auto constantBase = extract.getIndices().size() == 1
+                ? riscv_internal::constantContiguousIndexBase(extract.getIndices()[0])
+                : std::optional<int64_t>();
+            const bool contiguousProjection = constantBase && resultType &&
+                inputType.getShape().size() == 1 && resultType.getShape().size() == 1 &&
+                extract.getSelectors().size() == 1 &&
+                mlir::cast<mlir::StringAttr>(extract.getSelectors()[0]).getValue() == "gather" &&
+                inputType.getAxisIds() == resultType.getAxisIds() &&
+                inputExtent > resultExtent && resultExtent > 0 && inputExtent % resultExtent == 0 &&
+                *constantBase <= inputExtent - resultExtent && *constantBase % resultExtent == 0;
             for (mlir::Value value : {input, result})
-              if ((!domainProjection || value == result) &&
+              if ((!(domainProjection || contiguousProjection) || value == result) &&
                   connectedLaneSpans[value] != span) {
                 connectedLaneSpans[value] = span;
                 laneSpanChanged = true;
@@ -2987,6 +3039,53 @@ private:
       return false;
     }
     auto kernel = reduce->getParentOfType<riscv::KernelOp>();
+    auto before = input.getLayout();
+    const int64_t reducedLanes = before.getLaneFactors()[eliminated];
+    const bool survivingLanes = llvm::any_of(
+        llvm::enumerate(before.getLaneFactors().asArrayRef()),
+        [&](auto factor) { return factor.index() != eliminated && factor.value() > 1; });
+    if (before.getCarrier() == "rvv" && before.getValidity() == "full" &&
+        before.getReplicaGroup() == 1 && reducedLanes > 1 && survivingLanes &&
+        before.getLmulEighths() % reducedLanes == 0) {
+      // Hardware lane reductions return one scalar. When another lane axis
+      // survives, split the eliminated coordinate into register replicas so
+      // the existing register reduction keeps each free coordinate distinct.
+      llvm::SmallVector<int64_t> lanes(before.getLaneFactors().asArrayRef());
+      llvm::SmallVector<int64_t> replicas(before.getReplicaFactors().asArrayRef());
+      lanes[eliminated] = 1;
+      auto copies = riscv_internal::staticProduct({replicas[eliminated], reducedLanes});
+      if (!copies) {
+        reduce.emitError("reduction lane split exceeds the coordinate domain");
+        return false;
+      }
+      replicas[eliminated] = *copies;
+      const int64_t lmul = before.getLmulEighths() / reducedLanes;
+      auto count = riscv_internal::staticProduct(replicas);
+      auto groups = count ? riscv_internal::staticProduct({*count, std::max<int64_t>(1, (lmul + 7) / 8)})
+                          : std::optional<int64_t>();
+      if (!groups) {
+        reduce.emitError("reduction lane split has unbounded register residency");
+        return false;
+      }
+      auto split = riscv::LayoutAttr::get(builder.getContext(), "rvv", input.getAxisIds(),
+          before.getTimeFactors(), riscv_internal::integers(builder, lanes),
+          riscv_internal::integers(builder, replicas), before.getFragmentFactors(),
+          before.getLocalFactors(), before.getSew(), lmul, before.getVl() / reducedLanes,
+          *groups, "full");
+      auto splitType = mlir::cast<riscv::ValueType>(riscv_internal::withLayout(input, split));
+      if (riscv::supportsRVVLayout(kernel.getTarget(), split) &&
+          riscv::rvvLayoutRepackSlices(input, splitType)) {
+        mlir::OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPoint(reduce);
+        auto conversion = builder.create<riscv::ConvertLayoutOp>(reduce.getLoc(),
+            splitType, reduce.getInput(), riscv_internal::conversion(builder, "lane_repack", "pure",
+                riscv::rvvLayoutRepackTemporaryGroups(kernel.getTarget(), input, splitType)),
+            riscv::AccessAttr(), riscv_internal::unselectedLeaf(builder));
+        riscv_internal::copyOrigin(reduce, conversion);
+        reduce.getInputMutable().assign(conversion.getResult());
+        input = splitType;
+      }
+    }
     riscv::LayoutAttr projected = riscv_internal::projectLayout(
         builder, result, input.getLayout(), kernel.getTarget());
     if (!projected) {
@@ -3242,8 +3341,13 @@ private:
             mlir::isa<riscv::CastOp>(operation) && sourceInteger &&
             resultInteger &&
             sourceInteger.getWidth() == resultInteger.getWidth();
+        const bool sameElementPointwise =
+            (mlir::isa<riscv::BinaryOp, riscv::UnaryOp>(operation) &&
+             operandType.getElementType() == result.getElementType()) ||
+            (mlir::isa<riscv::CastOp, riscv::WidenOp, riscv::NarrowOp>(operation) &&
+             operandType.getLayout().getSew() == result.getLayout().getSew());
         riscv::LayoutAttr required =
-            (integerReinterpret || mlir::isa<riscv::BitcastOp>(operation) ||
+            (integerReinterpret || sameElementPointwise || mlir::isa<riscv::BitcastOp>(operation) ||
              (mlir::isa<riscv::MaterializeOp>(operation) &&
               operandType.getElementType() == result.getElementType())) &&
                     operandType.getShape() == result.getShape() &&

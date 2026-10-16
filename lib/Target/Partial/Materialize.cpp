@@ -2,6 +2,82 @@
 
 namespace weft::riscv_partial {
 
+namespace {
+mlir::FailureOr<mlir::Value> materializePlannedPartial(
+    riscv::RVVWidenDotOp dot, riscv::SequentialPartialPlanAttr plan,
+    int64_t outputPart, mlir::IRRewriter &rewriter) {
+  auto lhsType = mlir::cast<riscv::ValueType>(plan.getLhsIssueType());
+  auto rhsType = mlir::cast<riscv::ValueType>(plan.getRhsIssueType());
+  auto accumulatorType = mlir::cast<riscv::ValueType>(plan.getAccumulatorType());
+  auto kernel = dot->getParentOfType<riscv::KernelOp>();
+  const int64_t count = plan.getIssueCount();
+  const int64_t reductionAxis = plan.getReductionAxes()[0];
+  auto supply = [&](mlir::Value source, riscv::ValueType type,
+                    llvm::StringRef kind, mlir::DenseI64ArrayAttr parts,
+                    mlir::DenseI64ArrayAttr offsets, int64_t issue)
+      -> mlir::FailureOr<mlir::Value> {
+    const int64_t index = outputPart * count + issue;
+    if (index < 0 || index >= static_cast<int64_t>(parts.size()) ||
+        index >= static_cast<int64_t>(offsets.size()))
+      return mlir::failure();
+    if (kind == "slice") {
+      auto slice = rewriter.create<riscv::RVVIssueSliceOp>(
+          dot.getLoc(), type, source,
+          rewriter.getDenseI64ArrayAttr({parts[index]}),
+          rewriter.getDenseI64ArrayAttr({offsets[index]}),
+          riscv_internal::leaf(rewriter, "transfer", "issue-slice",
+              "rvv.issue-slice", "rvv.issue-slice", 0,
+              type.getLayout().getRegisterGroups(), 0, 0, "none", "exact"));
+      riscv_internal::copyOrigin(dot, slice);
+      return slice.getResult();
+    }
+    auto position = axisPosition(type, reductionAxis);
+    if (kind != "storage-rematerialize" || !kernel || !position)
+      return mlir::failure();
+    auto indexValue = rewriter.create<mlir::arith::ConstantIndexOp>(dot.getLoc(), issue);
+    llvm::DenseMap<mlir::Value, mlir::Value> clones;
+    auto value = cloneIssueWindow(source, reductionAxis, type.getShape()[*position],
+        indexValue, kernel.getTarget(), rewriter, clones);
+    if (mlir::failed(value) || (*value).getType() != type)
+      return mlir::failure();
+    return *value;
+  };
+  mlir::Value partial;
+  for (int64_t issue = 0; issue < count; ++issue) {
+    auto lhs = supply(dot.getLhs(), lhsType, plan.getLhsIssueSupply(),
+        plan.getLhsSourceParts(), plan.getLhsLaneOffsets(), issue);
+    auto rhs = supply(dot.getRhs(), rhsType, plan.getRhsIssueSupply(),
+        plan.getRhsSourceParts(), plan.getRhsLaneOffsets(), issue);
+    if (mlir::failed(lhs) || mlir::failed(rhs)) {
+      dot.emitError("selected partial issue supply cannot materialize its frozen projection; output=")
+          << outputPart << ", issue=" << issue;
+      return mlir::failure();
+    }
+    const int64_t operands = lhsType.getLayout().getRegisterGroups() +
+                             rhsType.getLayout().getRegisterGroups();
+    const int64_t groups = accumulatorType.getLayout().getRegisterGroups();
+    if (!partial) {
+      auto product = rewriter.create<riscv::RVVWidenMultiplyOp>(
+          dot.getLoc(), accumulatorType, *lhs, *rhs,
+          riscv_internal::leaf(rewriter, "rvv", "widen-multiply",
+              plan.getMultiplyInstruction(), plan.getMultiplyInstruction(),
+              operands, groups, 0, 0, "none", "exact"));
+      riscv_internal::copyOrigin(dot, product);
+      partial = product.getResult();
+    } else {
+      auto accumulate = rewriter.create<riscv::RVVWidenAccumulateOp>(
+          dot.getLoc(), accumulatorType, *lhs, *rhs, partial, plan.getReductionAxes(),
+          riscv_internal::leaf(rewriter, "rvv", "widen-accumulate",
+              plan.getAccumulateInstruction(), plan.getAccumulateInstruction(),
+              operands + groups, groups, 0, 0, "none", "agnostic"));
+      riscv_internal::copyOrigin(dot, accumulate);
+      partial = accumulate.getResult();
+    }
+  }
+  return partial;
+}
+} // namespace
+
 class MaterializeRISCVPartialAccumulatorsPass
     : public mlir::PassWrapper<MaterializeRISCVPartialAccumulatorsPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -905,6 +981,8 @@ public:
           dot.getPartialTopology().getOutputAxes().asArrayRef());
       auto layoutPlan = dot.getPartialLayoutPlanAttr();
       auto scalePlan = dot.getScaledPartialPlanAttr();
+      auto issuePlan = dot.getSequentialPartialPlanAttr();
+      const bool multipleIssues = dot.getReductionStreams() > 1;
       auto slotType =
           layoutPlan ? mlir::dyn_cast<riscv::ValueType>(
                            layoutPlan.getPartialSlotType())
@@ -930,8 +1008,14 @@ public:
                        (finalValue &&
                         finalValue.getAxisIds().asArrayRef() ==
                             llvm::ArrayRef<int64_t>(outputAxes))) &&
-                      lhs.getLayout().getTimeFactors()[*lhsReduction] == 1 &&
-                      rhs.getLayout().getTimeFactors()[*rhsReduction] == 1;
+                      (multipleIssues
+                           ? reduceBeforeScale && dot.getFusedStreamsLegal() && issuePlan &&
+                                 issuePlan.getRealization() == "fused_partial" &&
+                                 issuePlan.getIssueCount() == dot.getReductionStreams() &&
+                                 issuePlan.getAccumulatorType() == slotType &&
+                                 dot.getPartialTopology().getLaneSplit() == 1
+                           : lhs.getLayout().getTimeFactors()[*lhsReduction] == 1 &&
+                                 rhs.getLayout().getTimeFactors()[*rhsReduction] == 1);
       if (complete) {
         for (size_t position = 0; position < dotResult.getShape().size(); ++position)
           complete &= dotResult.getLayout().getTimeFactors()[position] == 1 &&
@@ -1254,26 +1338,57 @@ public:
           riscv_internal::copyOrigin(dot, reduced);
           partials = combineReducedPartials(reduced.getResult());
         } else if (reduceBeforeScale) {
-          llvm::SmallVector<int64_t> operandSlots(slots, 0);
-          auto set = rewriter.create<riscv::RVVPartialSetOp>(
-              reduce.getLoc(), directSetType, mlir::ValueRange{dot.getLhs()},
-              mlir::ValueRange{dot.getRhs()},
-              rewriter.getDenseI64ArrayAttr(operandSlots),
-              rewriter.getDenseI64ArrayAttr(operandSlots),
-              rewriter.getDenseI64ArrayAttr(lhsParts),
-              rewriter.getDenseI64ArrayAttr(rhsParts),
-              rewriter.getDenseI64ArrayAttr(lhsLaneOffsets),
-              rewriter.getDenseI64ArrayAttr(rhsLaneOffsets), reductionAxis,
-              scalePlan.getMultiplyInstruction(),
-              ownerDomain(reduce), nextPartialBirthId++, ownerDomain(reduce),
-              riscv_internal::leaf(
-                  rewriter, "rvv", "partial-set", "rvv.partial-set",
-                  "rvv.partial-set", 0, directSetType.getResourceGroups(), 0,
-                  0, "none", "exact", {reductionAxis, slots}));
-          riscv_internal::copyOrigin(dot, set);
-          sinkReplicaSupplies(set);
+          mlir::Value sourceSet;
+          if (multipleIssues) {
+            llvm::SmallVector<mlir::Value> products;
+            for (int64_t slot = 0; slot < slots; ++slot) {
+              auto resultPart = composeReplicaPart(dotResult, outputAxes, outputPart,
+                                                    partialAxes, slot);
+              if (!resultPart) {
+                dot.emitError("selected scaled partial lost its output/slot projection");
+                signalPassFailure();
+                return;
+              }
+              auto product = materializePlannedPartial(dot, issuePlan, *resultPart, rewriter);
+              if (mlir::failed(product)) {
+                signalPassFailure();
+                return;
+              }
+              products.push_back(*product);
+            }
+            auto collected = rewriter.create<riscv::RVVPartialCollectOp>(
+                reduce.getLoc(), directSetType, products,
+                ownerDomain(reduce), nextPartialBirthId++, ownerDomain(reduce),
+                riscv_internal::leaf(rewriter, "rvv", "partial-collect",
+                    "rvv.partial-collect", "rvv.partial-collect",
+                    directSetType.getResourceGroups(), directSetType.getResourceGroups(),
+                    0, 0, "none", slotType.getLayout().getValidity() == "tail" ? "agnostic" : "exact",
+                    {reductionAxis, slots}));
+            riscv_internal::copyOrigin(dot, collected);
+            sourceSet = collected.getResult();
+          } else {
+            llvm::SmallVector<int64_t> operandSlots(slots, 0);
+            auto set = rewriter.create<riscv::RVVPartialSetOp>(
+                reduce.getLoc(), directSetType, mlir::ValueRange{dot.getLhs()},
+                mlir::ValueRange{dot.getRhs()},
+                rewriter.getDenseI64ArrayAttr(operandSlots),
+                rewriter.getDenseI64ArrayAttr(operandSlots),
+                rewriter.getDenseI64ArrayAttr(lhsParts),
+                rewriter.getDenseI64ArrayAttr(rhsParts),
+                rewriter.getDenseI64ArrayAttr(lhsLaneOffsets),
+                rewriter.getDenseI64ArrayAttr(rhsLaneOffsets), reductionAxis,
+                scalePlan.getMultiplyInstruction(),
+                ownerDomain(reduce), nextPartialBirthId++, ownerDomain(reduce),
+                riscv_internal::leaf(
+                    rewriter, "rvv", "partial-set", "rvv.partial-set",
+                    "rvv.partial-set", 0, directSetType.getResourceGroups(), 0,
+                    0, "none", "exact", {reductionAxis, slots}));
+            riscv_internal::copyOrigin(dot, set);
+            sinkReplicaSupplies(set);
+            sourceSet = set.getResult();
+          }
           auto reduced = rewriter.create<riscv::RVVPartialReduceOp>(
-              reduce.getLoc(), reducedSetType, set.getResult(),
+              reduce.getLoc(), reducedSetType, sourceSet,
               riscv_internal::leaf(
                   rewriter, "rvv", "partial-reduce",
                   scalePlan.getReduceInstruction(),
@@ -1548,103 +1663,15 @@ public:
         auto combinePlan = contribution.dot->getAttrOfType<
             riscv::PartialCombinePlanAttr>("partial_combine_plan");
         auto issuePlan = contribution.dot.getSequentialPartialPlanAttr();
-        auto lhsIssue = mlir::cast<riscv::ValueType>(issuePlan.getLhsIssueType());
-        auto rhsIssue = mlir::cast<riscv::ValueType>(issuePlan.getRhsIssueType());
-        const int64_t issueCount = issuePlan.getIssueCount();
-        auto kernel = contribution.dot->getParentOfType<riscv::KernelOp>();
-        auto materializeIssueOperand =
-            [&](mlir::Value source, riscv::ValueType issueType,
-                llvm::StringRef supply, mlir::DenseI64ArrayAttr sourceParts,
-                mlir::DenseI64ArrayAttr laneOffsets, size_t index,
-                int64_t issue) -> mlir::FailureOr<mlir::Value> {
-          if (supply == "slice") {
-            auto slice = rewriter.create<riscv::RVVIssueSliceOp>(
-                yield.getLoc(), issueType, source,
-                rewriter.getDenseI64ArrayAttr({sourceParts[index]}),
-                rewriter.getDenseI64ArrayAttr({laneOffsets[index]}),
-                riscv_internal::leaf(
-                    rewriter, "transfer", "issue-slice", "rvv.issue-slice",
-                    "rvv.issue-slice", 0,
-                    issueType.getLayout().getRegisterGroups(), 0, 0, "none",
-                    "exact"));
-            riscv_internal::copyOrigin(contribution.dot, slice);
-            return slice.getResult();
-          }
-          auto position = axisPosition(issueType, reductionAxis);
-          if (supply != "storage-rematerialize" || !kernel || !position)
-            return mlir::failure();
-          auto issueIndex = rewriter.create<mlir::arith::ConstantIndexOp>(
-              yield.getLoc(), issue);
-          llvm::DenseMap<mlir::Value, mlir::Value> clones;
-          auto projected = cloneIssueWindow(
-              source, reductionAxis, issueType.getShape()[*position],
-              issueIndex.getResult(), kernel.getTarget(), rewriter, clones);
-          if (mlir::failed(projected) || (*projected).getType() != issueType)
-            return mlir::failure();
-          return *projected;
-        };
         for (int64_t outputPart = 0; outputPart < *carryParts; ++outputPart) {
-          mlir::Value partial;
-          for (int64_t issue = 0; issue < issueCount; ++issue) {
-            const size_t index =
-                static_cast<size_t>(outputPart * issueCount + issue);
-            auto lhsSlice = materializeIssueOperand(
-                contribution.dot.getLhs(), lhsIssue,
-                issuePlan.getLhsIssueSupply(),
-                issuePlan.getLhsSourceParts(), issuePlan.getLhsLaneOffsets(),
-                index, issue);
-            auto rhsSlice = materializeIssueOperand(
-                contribution.dot.getRhs(), rhsIssue,
-                issuePlan.getRhsIssueSupply(),
-                issuePlan.getRhsSourceParts(), issuePlan.getRhsLaneOffsets(),
-                index, issue);
-            if (mlir::failed(lhsSlice) || mlir::failed(rhsSlice)) {
-              contribution.dot.emitError(
-                  "selected issue supply cannot materialize its frozen storage/view program; output_part=")
-                  << outputPart << ", issue=" << issue
-                  << ", lhs_supply=" << issuePlan.getLhsIssueSupply()
-                  << ", lhs_source=" << contribution.dot.getLhs().getType()
-                  << ", lhs_issue=" << lhsIssue
-                  << ", rhs_supply=" << issuePlan.getRhsIssueSupply()
-                  << ", rhs_source=" << contribution.dot.getRhs().getType()
-                  << ", rhs_issue=" << rhsIssue;
-              failed = true;
-              break;
-            }
-            if (!partial) {
-              auto product = rewriter.create<riscv::RVVWidenMultiplyOp>(
-                  yield.getLoc(), slotType, *lhsSlice, *rhsSlice,
-                  riscv_internal::leaf(
-                      rewriter, "rvv", "widen-multiply",
-                      issuePlan.getMultiplyInstruction(),
-                      issuePlan.getMultiplyInstruction(),
-                      lhsIssue.getLayout().getRegisterGroups() +
-                          rhsIssue.getLayout().getRegisterGroups(),
-                      slotType.getLayout().getRegisterGroups(), 0, 0, "none",
-                      "exact"));
-              riscv_internal::copyOrigin(contribution.dot, product);
-              partial = product.getResult();
-            } else {
-              auto accumulate = rewriter.create<riscv::RVVWidenAccumulateOp>(
-                  yield.getLoc(), slotType, *lhsSlice, *rhsSlice, partial,
-                  issuePlan.getReductionAxes(),
-                  riscv_internal::leaf(
-                      rewriter, "rvv", "widen-accumulate",
-                      issuePlan.getAccumulateInstruction(),
-                      issuePlan.getAccumulateInstruction(),
-                      lhsIssue.getLayout().getRegisterGroups() +
-                          rhsIssue.getLayout().getRegisterGroups() +
-                          slotType.getLayout().getRegisterGroups(),
-                      slotType.getLayout().getRegisterGroups(), 0, 0, "none",
-                      "agnostic"));
-              riscv_internal::copyOrigin(contribution.dot, accumulate);
-              partial = accumulate.getResult();
-            }
-          }
-          if (failed)
+          auto partial = materializePlannedPartial(contribution.dot, issuePlan,
+                                                   outputPart, rewriter);
+          if (mlir::failed(partial)) {
+            failed = true;
             break;
+          }
           OutputPartialOperands &operands = outputOperands[outputPart];
-          operands.partials.push_back(partial);
+          operands.partials.push_back(*partial);
           operands.scales.push_back(contribution.scale);
           operands.scaleReplicas.push_back(
               combinePlan.getScaleParts()[outputPart]);
