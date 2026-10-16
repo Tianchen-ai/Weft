@@ -2,6 +2,8 @@
 
 **面向 RISC-V 的数值 kernel 语言与编译器。**
 
+Weft 是东山社区[天辰 AI 软件栈](https://gitee.com/dongshan-community/TianChen_Software_Stack)中面向 RISC-V 的高性能算子编译器。本仓库提供环境准备、使用指南、开发与验证说明，软件栈的整体定位和组件导航见顶层入口。开发主源位于 [GitHub](https://github.com/Tianchen-ai/Weft)，同步镜像位于 [Gitee](https://gitee.com/dongshan-community/Weft)。
+
 采用 [Apache-2.0](LICENSE) 许可证。
 
 [English](README.md) · [安装](doc/getting-started/installation.md) ·

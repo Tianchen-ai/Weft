@@ -2,6 +2,8 @@
 
 **A numerical kernel language and compiler for RISC-V.**
 
+Weft is the RISC-V kernel compiler in the Dongshan Community's [TianChen AI Software Stack](https://gitee.com/dongshan-community/TianChen_Software_Stack). This repository provides installation, usage, development, and validation guides; the top-level repository maps the stack's components. Development is maintained on [GitHub](https://github.com/Tianchen-ai/Weft), with a [Gitee mirror](https://gitee.com/dongshan-community/Weft).
+
 Licensed under [Apache-2.0](https://github.com/Tianchen-ai/Weft/blob/main/LICENSE).
 
 [中文](https://github.com/Tianchen-ai/Weft/blob/main/README.zh-CN.md) · [Install](https://github.com/Tianchen-ai/Weft/blob/main/doc/getting-started/installation.md) ·
