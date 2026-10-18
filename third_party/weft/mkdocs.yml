@@ -1,0 +1,82 @@
+site_name: Triton Weft Model Handbook
+site_description: Structured numerical programs and native RISC-V compilation in Triton
+site_url: https://tianchen-ai.github.io/Weft/
+repo_url: https://github.com/Tianchen-ai/Weft
+repo_name: Tianchen-ai/Weft
+edit_uri: edit/triton-weft/third_party/weft/doc/
+docs_dir: doc
+site_dir: !ENV [WEFT_DOCS_SITE_DIR, /tmp/weft-docs-site]
+strict: true
+theme:
+  name: material
+  font: false
+  palette:
+    - scheme: default
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/brightness-4
+        name: Switch to dark mode
+    - scheme: slate
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/brightness-7
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - navigation.footer
+    - content.code.copy
+    - search.suggest
+    - search.highlight
+plugins:
+  - search
+markdown_extensions:
+  - admonition
+  - tables
+  - pymdownx.superfences
+  - toc:
+      permalink: true
+      slugify: !!python/name:markdown.extensions.toc.slugify_unicode
+validation:
+  nav:
+    omitted_files: warn
+    not_found: warn
+  links:
+    not_found: warn
+    anchors: warn
+nav:
+  - Home: index.md
+  - Getting started:
+      - Installation: getting-started/installation.md
+      - Quick start: getting-started/quickstart.md
+      - Runnable examples: getting-started/examples.md
+  - Language:
+      - Programming model: programming-model/index.md
+      - Non-goals: programming-model/non-goals.md
+      - Encoding and artifacts: dsl/encoding-and-artifacts.md
+      - Values and levels: dsl/values-and-levels.md
+      - Functions and operations: dsl/functions-and-operations.md
+      - Examples: dsl/examples.md
+      - Model programs: dsl/programs.md
+      - Canonical IR: dsl/canonical-ir.md
+  - Compiler:
+      - Overview: compiler/index.md
+      - Physical machine: compiler/physical-machine.md
+      - Physical IR: compiler/riscv-ir.md
+      - Passes: compiler/passes.md
+      - Optimization principles: compiler/optimization-principles.md
+      - Local operations: compiler/leaves.md
+      - Code emission: compiler/emission.md
+  - Integrations:
+      - Applications: integrations/overview.md
+      - Runtime reference: compiler/runtime.md
+      - Native SDK and llama.cpp: compiler/native-sdk.md
+  - Development:
+      - Extend RISC-V: development/extensions.md
+      - Correctness and measurement: development/validation.md
+      - Baselines and attribution: development/benchmarking.md
+      - Build and publish docs: development/documentation.md

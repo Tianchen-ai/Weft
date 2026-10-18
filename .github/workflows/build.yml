@@ -1,0 +1,56 @@
+name: Build Triton and Weft
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  wheel:
+    runs-on: ubuntu-24.04
+    env:
+      TRITON_BUILD_PROTON: 'OFF'
+      TRITON_APPEND_CMAKE_ARGS: '-DCMAKE_CXX_FLAGS=-Wno-error=deprecated-declarations'
+      MAX_JOBS: 2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r python/requirements.txt build
+      - run: python -m build --wheel --no-isolation
+      - run: python -m pip install --no-deps dist/*.whl
+      - run: python -c "import triton; from triton._C.libtriton import weft; from triton.runtime.package import sdk_prefix; print(triton.__version__, sdk_prefix())"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: triton-host-wheel
+          path: dist/*.whl
+  handbook:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r third_party/weft/requirements-docs.txt
+      - run: mkdocs build --strict -f third_party/weft/mkdocs.yml --site-dir ../../build/handbook
+      - uses: actions/upload-pages-artifact@v3
+        if: github.event_name != 'pull_request'
+        with:
+          path: build/handbook
+  publish-handbook:
+    if: github.event_name != 'pull_request' && github.ref_name == github.event.repository.default_branch
+    needs: handbook
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    concurrency:
+      group: handbook-pages
+      cancel-in-progress: false
+    steps:
+      - uses: actions/deploy-pages@v4
+        id: deployment

@@ -1,0 +1,26 @@
+from __future__ import annotations
+
+import formats.ggml as ggml
+import triton
+import triton.language as wl
+
+
+@triton.jit(model="weft")
+def compute(W: wl.View[ggml.Q5_1, (K,)], X: wl.View[ggml.Q8_1, (K,)]):
+    result = wl.f32(0.0)
+    with wl.level.blocks(K, extent=32) as kb:
+        w = wl.load(W[kb])
+        x = wl.load(X[kb])
+        q = wl.u8(w.q) | wl.u8(w.qh) << wl.u8(4)
+        integer = wl.reduce_dot(q, x.q, over="k", acc_dtype=wl.i32)
+        result += wl.f32(w.d) * wl.f32(x.d) * wl.f32(integer) + wl.f32(w.m) * wl.f32(
+            x.s
+        )
+    return result
+
+
+@triton.jit(model="weft")
+def quantized_vec_dot_q5_1_q8_1(
+    W: wl.View[ggml.Q5_1, (K,)], X: wl.View[ggml.Q8_1, (K,)], Y: wl.View[wl.f32, (1,)]
+):
+    wl.store(Y[0], compute(W, X))

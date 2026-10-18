@@ -1,0 +1,8 @@
+set(LLVM_TARGET_DEFINITIONS KernelOps.td)
+mlir_tablegen(KernelOpsDialect.h.inc -gen-dialect-decls -dialect=weft_kernel)
+mlir_tablegen(KernelOpsDialect.cpp.inc -gen-dialect-defs -dialect=weft_kernel)
+mlir_tablegen(KernelTypes.h.inc -gen-typedef-decls -typedefs-dialect=weft_kernel)
+mlir_tablegen(KernelTypes.cpp.inc -gen-typedef-defs -typedefs-dialect=weft_kernel)
+mlir_tablegen(KernelOps.h.inc -gen-op-decls)
+mlir_tablegen(KernelOps.cpp.inc -gen-op-defs)
+add_public_tablegen_target(WeftKernelIncGen)

@@ -1,0 +1,10 @@
+{
+  "binding_origin": "historical-selection",
+  "physical_defaults": {"lmul_eighths":8,"unroll":1,"pipeline_depth":1,"scalar_load_prime":0,"partial_combine_policy":"independent-multilevel","record_axis_policy":"within-record"},
+  "bindings": {
+    "kernel:k1 q4_k_gemv": {"entry":"q4_k.py","symbol":"q4_k_q8_k_gemv","source":{},"physical":{}},
+    "kernel:k1 q4_k_gemv_groups4": {"entry":"q4_k_groups4.py","symbol":"q4_k_q8_k_gemv_groups4","source":{},"physical":{}},
+    "kernel:sg2044 q4_k_gemv": {"entry":"q4_k.py","symbol":"q4_k_q8_k_gemv","source":{},"physical":{}},
+    "kernel:sg2044 q4_k_gemv_groups4": {"entry":"q4_k_groups4.py","symbol":"q4_k_q8_k_gemv_groups4","source":{},"physical":{"lmul_eighths":32,"unroll":2,"pipeline_depth":1}}
+  }
+}

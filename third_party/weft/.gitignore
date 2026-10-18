@@ -1,0 +1,33 @@
+# Python and editor-local state
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+/.claude/settings.local.json
+/.claude/worktrees/
+
+# Rebuildable outputs
+/build/
+/build-*/
+/build-demo/
+/cmake-build-*/
+/dist/
+/site/
+/.codegraph/
+*.log
+
+# Local parallel worktrees
+/.worktrees/
+
+# Local development records and reference corpora
+/AGENTS.md
+/report/
+/tasks/
+/.agents/
+/.codex/
+/.claude/
+/source/c/
+/examples/run/ggml.sh
+/examples/run/ggml-kernel.sh

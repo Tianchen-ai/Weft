@@ -1,0 +1,22 @@
+This source distribution embeds the Weft compiler in Triton 3.8.0.
+
+Triton is distributed under the MIT license in LICENSE. Its upstream source is
+https://github.com/triton-lang/triton/tree/v3.8.0.
+
+The Weft compiler, language and native runtime retain their Apache-2.0 license
+and notices in third_party/weft/LICENSE and third_party/weft/NOTICE. This also
+applies to the migrated Weft modules in python/triton/compiler/weft,
+python/triton/language/weft, python/triton/runtime/weft,
+python/triton/backends/weft, python/src/weft.cc, python/src/weft_runtime.cc,
+python/triton/tools/llama_cpp.py,
+python/triton/tools/pytorch.py, python/triton/experimental/torch,
+python/triton/runtime/_model_registry.py, and the native package integration in
+python/triton/runtime/package.py.
+
+third_party/weft/THIRD_PARTY_NOTICES.md records the licenses of the original
+Weft source corpus and its dependencies. Other third_party directories retain
+the notices supplied by upstream Triton.
+
+LLVM and Clang SDK distributions retain the Apache-2.0 WITH LLVM-exception
+license supplied by LLVM. SDK build artifacts are not source files in this
+repository.

@@ -1,0 +1,17 @@
+graft bin
+graft cmake
+graft docs
+graft examples
+graft include
+graft lib
+graft python/src
+graft python/triton
+graft third_party
+include CMakeLists.txt
+include Makefile
+include python/build_helpers.py
+include python/requirements.txt
+include NOTICE
+global-exclude __pycache__
+global-exclude __pycache__/*
+global-exclude *.py[cod]

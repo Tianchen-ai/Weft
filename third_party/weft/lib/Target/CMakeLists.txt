@@ -1,0 +1,115 @@
+add_library(WeftRISCVTarget STATIC
+  ${WEFT_RISCV_EXTENSION_EMISSION_SOURCES}
+  RISCVPhysicalSupport.cpp
+  RISCVCompilation.cpp
+  RISCVCompilerOptions.cpp
+  RISCVPipeline.cpp
+  BindSourceParameters.cpp
+  LocalMemory.cpp
+  LocalStorageFootprint.cpp
+  AlignRISCVLocalStorage.cpp
+  ControlStorage.cpp
+  PhysicalLoopControl.cpp
+  DenseIssue.cpp
+  DenseTransfer.cpp
+  DenseProducerGraph.cpp
+  ContractionSupply.cpp
+  ConvertWeftToRISCV.cpp
+  MaterializeRISCVReductions.cpp
+  MaterializeRISCVAtomics.cpp
+  FinalizeRISCVHelpers.cpp
+  SelectRISCVOperations.cpp
+  PropagateRISCVLayouts.cpp
+  PlanRISCVResidency.cpp
+  PlanRISCVMemory.cpp
+  PointerMemory.cpp
+  SpecializeRISCVMemory.cpp
+  SelectRISCVDenseTransfers.cpp
+  SelectRISCVFMAIssues.cpp
+  ContractRISCVFloatingPoint.cpp
+  SelectRISCVScalarPackets.cpp
+  SimplifyRISCVControl.cpp
+  PlanRISCVFieldStores.cpp
+  CanonicalizeRISCVLayouts.cpp
+  ConsumerLayouts.cpp
+  FuseRISCVBitplanes.cpp
+  LowerRISCVComposites.cpp
+  MaterializeRISCVDenseFragmentLoads.cpp
+  MaterializeRISCVLocalWindows.cpp
+  MaterializeRISCVValuePrograms.cpp
+  DenseValuePrograms.cpp
+  DenseContractions.cpp
+  DenseContractionEpilogue.cpp
+  DensePanelTransfer.cpp
+  SelectRISCVPanelTransfers.cpp
+  PanelTransferSelection.cpp
+  ValueLiveness.cpp
+  LocalLifetime.cpp
+  ForwardLocalCopies.cpp
+  MaterializeRISCVPrograms.cpp
+  VectorizeRISCVRecordLoops.cpp
+  HoistRISCVLoopInvariants.cpp
+  ScheduleRISCVLevels.cpp
+  PipelineRISCVLevels.cpp
+  PipelineShapeBindings.cpp
+  PipelineSchedule.cpp
+  PhysicalDiagnostics.cpp
+  UnrollRISCVLevels.cpp
+  ShareRISCVLayeredWindows.cpp
+  Partial/Support.cpp
+  Partial/AddTrees.cpp
+  Partial/PlanTopologies.cpp
+  Partial/Materialize.cpp
+  FinalizeRISCVLeaves.cpp
+  PredicateRegisters.cpp
+  SelectRISCVScalarLoadPrimes.cpp
+  ContractRISCVIntegerPointwise.cpp
+  MaterializeRISCVReadSnapshots.cpp
+  MaterializeRISCVResources.cpp
+  FuseRISCVPhysicalIssueLoops.cpp
+  EliminateDeadRISCVLayouts.cpp
+  VerifyFinalRISCV.cpp
+  RISCVIntrinsicC.cpp
+  Emission/Control.cpp
+  Emission/Functions.cpp
+  Emission/ScalarControl.cpp
+  Emission/Layout.cpp
+  Emission/Memory.cpp
+  Emission/RVVArithmetic.cpp
+  Emission/Predicates.cpp
+  Emission/VectorTiles.cpp
+  Emission/FMAIssues.cpp
+  Emission/Encoding.cpp
+  Emission/FieldStorage.cpp
+  Emission/RVVMemory.cpp
+  Emission/IME.cpp
+  IME/FragmentEmission.cpp
+  IME/FragmentMaterialization.cpp
+  IME/FragmentSupply.cpp
+  Emission/RVVBitplanes.cpp
+  Emission/RVVContraction.cpp
+  Emission/RVVPartial.cpp
+  Emission/Support.cpp
+  RISCVCompiler.cpp
+)
+
+target_include_directories(WeftRISCVTarget PRIVATE ${WEFT_RISCV_EXTENSION_REGISTRY_DIR})
+target_link_libraries(WeftRISCVTarget PUBLIC
+  WeftRISCVPlatform
+  WeftRISCVContracts
+  WeftKernelDialect
+  WeftRISCVDialect
+  MLIRArithDialect
+  MLIRAsmParser
+  MLIRIR
+  MLIRPass
+  MLIRSCFDialect
+  MLIRSCFTransforms
+  MLIRTransforms
+)
+
+if(LLVM_LINK_LLVM_DYLIB)
+  llvm_config(WeftRISCVTarget USE_SHARED TargetParser)
+else()
+  llvm_config(WeftRISCVTarget TargetParser)
+endif()
