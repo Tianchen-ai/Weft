@@ -5,13 +5,15 @@ triton 模块的发行包。Weft 编译核心位于 third_party/weft，没有需
 
 ## 源码构建
 
-使用独立 Python 3.10+ 环境、CMake、Ninja 和支持 C++20 的编译器。
+使用独立 Python 3.10+ 环境、CMake、Ninja 和匹配 LLVM SDK 中的 Clang。
 LLVM/MLIR 必须匹配仓库 cmake/llvm-info.json 指定的 revision；Weft、Triton、
 TableGen 与 native bindings 共用这一份 SDK，不能链接旧的独立 Weft LLVM 产物。
 
 ```sh
 python -m venv /path/to/environment
 /path/to/environment/bin/python -m pip install -r python/requirements.txt
+CC=/path/to/matched-llvm-sdk/bin/clang \
+CXX=/path/to/matched-llvm-sdk/bin/clang++ \
 LLVM_SYSPATH=/path/to/matched-llvm-sdk \
 TRITON_WEFT_CLANG_ROOT=/path/to/native-clang-23 \
 TRITON_WEFT_OPENMP_LIBRARY=/path/to/libomp.so \
@@ -40,6 +42,8 @@ RISC-V 机器需要适配其 Python ABI、libc 和 C++ runtime 的编译环境�
 TRITON_WEFT_CLANG_ROOT=/path/to/native-clang \
 TRITON_WEFT_OPENMP_LIBRARY=/path/to/libomp.so \
 TRITON_WEFT_OPENMP_INCLUDE_DIR=/path/to/omp-headers \
+CC=/path/to/matched-llvm-sdk/bin/clang \
+CXX=/path/to/matched-llvm-sdk/bin/clang++ \
 LLVM_SYSPATH=/path/to/matched-llvm-sdk \
 TRITON_BUILD_DIR=/path/to/build \
 TRITON_BUILD_PROTON=OFF \

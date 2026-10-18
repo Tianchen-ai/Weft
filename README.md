@@ -30,6 +30,8 @@ Build this checkout in a dedicated Python environment. A normal upstream
 ```sh
 python -m venv /path/to/environment
 /path/to/environment/bin/python -m pip install -r python/requirements.txt
+CC=/path/to/matched-llvm-sdk/bin/clang \
+CXX=/path/to/matched-llvm-sdk/bin/clang++ \
 LLVM_SYSPATH=/path/to/matched-llvm-sdk \
 TRITON_WEFT_CLANG_ROOT=/path/to/native-clang-23 \
 TRITON_WEFT_OPENMP_LIBRARY=/path/to/libomp.so \
