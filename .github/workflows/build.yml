@@ -18,10 +18,8 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install -r python/requirements.txt build
-      - name: Select the matched Clang and OpenMP SDK
+      - name: Select the matching LLVM compiler
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libomp-18-dev
           python python/build_helpers.py write_thirdparty_cmake_vars --triton-cache-path "$RUNNER_TEMP/triton-dependencies" --packages llvm --output "$RUNNER_TEMP/triton-llvm.cmake"
           python - <<'PY'
           import os
@@ -32,10 +30,7 @@ jobs:
           if len(matches) != 1:
               raise RuntimeError("LLVM helper did not resolve one SDK")
           sdk = Path(matches[0])
-          values = {"LLVM_SYSPATH": sdk, "CC": sdk / "bin/clang", "CXX": sdk / "bin/clang++",
-                    "TRITON_WEFT_CLANG_ROOT": sdk,
-                    "TRITON_WEFT_OPENMP_LIBRARY": Path("/usr/lib/llvm-18/lib/libomp.so"),
-                    "TRITON_WEFT_OPENMP_INCLUDE_DIR": Path("/usr/lib/llvm-18/lib/clang/18/include")}
+          values = {"LLVM_SYSPATH": sdk, "CC": sdk / "bin/clang", "CXX": sdk / "bin/clang++"}
           for key, path in values.items():
               if not path.exists():
                   raise RuntimeError(f"missing {key}: {path}")
@@ -48,7 +43,7 @@ jobs:
       - run: python -c "import triton; from triton._C.libtriton import weft; from triton.runtime.package import sdk_prefix; print(triton.__version__, sdk_prefix())"
       - uses: actions/upload-artifact@v4
         with:
-          name: triton-host-wheel
+          name: triton-host-compiler-wheel
           path: dist/*.whl
   handbook:
     runs-on: ubuntu-24.04
